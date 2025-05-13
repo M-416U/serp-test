@@ -115,8 +115,6 @@ export class RankTrackerWorker {
         errors.push(error.message);
         retries++;
         console.error(`Error checking rank for "${keyword}": ${error.message}`);
-
-        // Add a maximum retry limit to prevent infinite loops
         if (retries > 1000) {
           console.log(
             `[WARNING] Reached maximum retries (1000) for keyword "${keyword}". Saving with null rank.`
@@ -258,14 +256,18 @@ export class RankTrackerWorker {
       // @ts-ignore
       await page.navigate(searchUrl);
 
-      const { solved, errors } = await this.detectAndHandleCaptcha(page);
+      const { solved, errors, shouldRetryWithNewProxy } =
+        await this.detectAndHandleCaptcha(page);
       captchaSolved = solved;
       captchaErrors = errors;
-      if (errors === 10) {
-        throw new Error(`CAPTCHA detected! ${proxy.port} try new proxy"`);
+      if (shouldRetryWithNewProxy) {
+        throw new Error(
+          `CAPTCHA detected and couldn't be solved. Try with new proxy.`
+        );
         // @ts-ignore
         return null;
       }
+
       await this.randomDelay();
       const results = await this.extractSearchResults(page);
       let rank = 0;
@@ -441,12 +443,16 @@ export class RankTrackerWorker {
       );
     }) as any);
   }
-
-  private async detectAndHandleCaptcha(
-    page: Page
-  ): Promise<{ solved: number; errors: number }> {
+  // ... existing code ...
+  private async detectAndHandleCaptcha(page: Page): Promise<{
+    solved: number;
+    errors: number;
+    shouldRetryWithNewProxy: boolean;
+  }> {
     let solved = 0;
     let errors = 0;
+    let shouldRetryWithNewProxy = false;
+
     try {
       const captchaSelectors = [
         // reCAPTCHA selectors
@@ -455,167 +461,103 @@ export class RankTrackerWorker {
         "form#captcha-form",
       ];
 
-      const maxAttempts = 3;
-      let attempts = 0;
-
-      while (attempts < maxAttempts) {
-        const captchaType = await page.evaluate((selectors: any) => {
-          for (const selector of selectors) {
-            if (selector.includes(":contains(")) {
-              const [tagName, textContent] = selector.split(":contains(");
-              const text = textContent.replace(/["')]/g, "");
-              const elements = Array.from(document.querySelectorAll(tagName));
-              for (const el of elements) {
-                if (el.textContent && el.textContent.includes(text)) {
-                  return "text";
-                }
-              }
-            } else {
-              const element = document.querySelector(selector);
-              if (element) {
-                if (selector.includes("recaptcha")) return "recaptcha";
-                if (
-                  selector.includes("captcha-form") ||
-                  (selector.includes("img") && selector.includes("captcha"))
-                )
-                  return "image";
-                return "recaptcha";
+      // Check if CAPTCHA is present
+      const captchaType = await page.evaluate((selectors: any) => {
+        for (const selector of selectors) {
+          if (selector.includes(":contains(")) {
+            const [tagName, textContent] = selector.split(":contains(");
+            const text = textContent.replace(/["')]/g, "");
+            const elements = Array.from(document.querySelectorAll(tagName));
+            for (const el of elements) {
+              if (el.textContent && el.textContent.includes(text)) {
+                return "text";
               }
             }
+          } else {
+            const element = document.querySelector(selector);
+            if (element) {
+              if (selector.includes("recaptcha")) return "recaptcha";
+              if (
+                selector.includes("captcha-form") ||
+                (selector.includes("img") && selector.includes("captcha"))
+              )
+                return "image";
+              return "recaptcha";
+            }
           }
-          return null;
-        }, captchaSelectors);
-
-        if (!captchaType) {
-          return { solved, errors };
         }
-        if (captchaType) {
-          return { solved, errors: 10 };
-        }
+        return null;
+      }, captchaSelectors);
 
-        console.log(
-          `CAPTCHA detected (Type: ${captchaType})! Attempt ${
-            attempts + 1
-          } of ${maxAttempts}`
-        );
-        throw new Error("CAPTCHA detected!");
-
-        // try {
-        //   switch (captchaType) {
-        //     case "recaptcha":
-        //       // @ts-ignore
-        //       await page.solveRecaptchas();
-        //       solved++;
-        //       break;
-
-        //     case "image":
-        //       const imageCaptchaElement = await page.$("form#captcha-form img");
-        //       if (imageCaptchaElement) {
-        //         const imageBase64 = await imageCaptchaElement.screenshot({
-        //           encoding: "base64",
-        //         });
-
-        //         const response = await fetch("http://2captcha.com/in.php", {
-        //           method: "POST",
-        //           headers: {
-        //             "Content-Type": "application/x-www-form-urlencoded",
-        //           },
-        //           body: new URLSearchParams({
-        //             key: CONFIG.CAPTCHA_API_KEY,
-        //             method: "base64",
-        //             body: imageBase64,
-        //             json: "1",
-        //           }),
-        //         });
-
-        //         const result = await response.json();
-        //         if (result.status === 1) {
-        //           let captchaSolved = false;
-        //           let solution = "";
-        //           const maxWaitTime = 60000; // 60 seconds
-        //           const startTime = Date.now();
-
-        //           while (
-        //             !captchaSolved &&
-        //             Date.now() - startTime < maxWaitTime
-        //           ) {
-        //             await this.delay(5000);
-        //             const checkResponse = await fetch(
-        //               `http://2captcha.com/res.php?key=${CONFIG.CAPTCHA_API_KEY}&action=get&id=${result.request}&json=1`
-        //             );
-        //             const checkResult = await checkResponse.json();
-        //             if (checkResult.status === 1) {
-        //               solution = checkResult.request;
-        //               captchaSolved = true;
-        //               solved++;
-        //             }
-        //           }
-
-        //           if (captchaSolved) {
-        //             const inputField = await page.$('input[name="captcha"]');
-        //             if (inputField) {
-        //               await inputField.type(solution);
-        //             }
-        //           } else {
-        //             errors++;
-        //           }
-        //         } else {
-        //           errors++;
-        //         }
-        //       }
-        //       break;
-        //     default:
-        //       console.log(`Unknown CAPTCHA type: ${captchaType}`);
-        //       errors++;
-        //       break;
-        //   }
-
-        //   // Try to find and click submit button
-        //   const submitButton = await page.$(
-        //     'button[type="submit"], input[type="submit"]'
-        //   );
-        //   if (submitButton) {
-        //     await submitButton.click();
-        //   }
-
-        //   // Wait for navigation and check if we're past the CAPTCHA
-        //   await page.waitForNavigation({
-        //     timeout: CONFIG.BROWSER_TIMEOUT_MS,
-        //     waitUntil: ["networkidle0", "domcontentloaded"],
-        //   });
-
-        //   // Add random delay between attempts
-        //   await this.randomDelay();
-
-        //   // Check if CAPTCHA is still present
-        //   const stillHasCaptcha = await page.evaluate((selectors) => {
-        //     return selectors.some((selector) =>
-        //       selector.includes(":contains(")
-        //         ? document.body.textContent?.includes(
-        //             selector.split(":contains(")[1].replace(/["')]/g, "")
-        //           )
-        //         : !!document.querySelector(selector)
-        //     );
-        //   }, captchaSelectors);
-
-        //   if (!stillHasCaptcha) {
-        //     return { solved, errors };
-        //   }
-        // } catch (error: any) {
-        //   console.error(`Error solving ${captchaType} CAPTCHA:`, error);
-        //   errors++;
-        // }
-
-        // attempts++;
-        // // Add increasing delay between attempts
-        // await this.delay(CONFIG.RETRY_DELAY_MS * Math.pow(2, attempts));
+      if (!captchaType) {
+        return { solved, errors, shouldRetryWithNewProxy: false };
       }
 
-      throw new Error(`Failed to solve CAPTCHA after ${maxAttempts} attempts`);
+      console.log(
+        `CAPTCHA detected (Type: ${captchaType})! Attempting to solve once...`
+      );
+
+      try {
+        switch (captchaType) {
+          case "recaptcha":
+            // @ts-ignore
+            await page.solveRecaptchas();
+            solved++;
+            break;
+
+          case "image":
+            errors++;
+            break;
+
+          default:
+            console.log(`Unknown CAPTCHA type: ${captchaType}`);
+            errors++;
+            break;
+        }
+
+        // Try to find and click submit button
+        const submitButton = await page.$(
+          'button[type="submit"], input[type="submit"]'
+        );
+        if (submitButton) {
+          await submitButton.click();
+        }
+
+        await page.waitForNavigation({
+          timeout: CONFIG.BROWSER_TIMEOUT_MS,
+          waitUntil: ["networkidle0", "domcontentloaded"],
+        });
+
+        await this.randomDelay();
+
+        // Check if CAPTCHA is still present after our attempt
+        const stillHasCaptcha = await page.evaluate((selectors) => {
+          return selectors.some((selector) =>
+            selector.includes(":contains(")
+              ? document.body.textContent?.includes(
+                  selector?.split(":contains(")[1]!.replace(/["')]/g, "")
+                )
+              : !!document.querySelector(selector)
+          );
+        }, captchaSelectors);
+
+        if (stillHasCaptcha) {
+          console.log(
+            "CAPTCHA still present after solving attempt. Will retry with new proxy."
+          );
+          shouldRetryWithNewProxy = true;
+        }
+      } catch (error: any) {
+        console.error(`Error solving ${captchaType} CAPTCHA:`, error);
+        errors++;
+        shouldRetryWithNewProxy = true;
+      }
+
+      return { solved, errors, shouldRetryWithNewProxy };
     } catch (error: any) {
       console.error(`Error handling CAPTCHA: ${error.message}`);
       errors++;
-      return { solved, errors };
+      return { solved, errors, shouldRetryWithNewProxy: true };
     }
   }
 }
