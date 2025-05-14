@@ -181,7 +181,7 @@ export class RankTrackerWorker {
 
       const UndetectableBMS = new UndetectableBrowser(
         await puppeteer.launch({
-          headless: false,
+          headless: true,
           executablePath: process.env.BRAVE_PATH!,
           userDataDir: userDataDir,
           args: [
