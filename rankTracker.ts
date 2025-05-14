@@ -7,8 +7,8 @@ import * as path from "path";
 const UndetectableBrowser = require("undetected-browser");
 
 // puppeteer extra plugins
-// const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-// puppeteer.use(StealthPlugin());
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(StealthPlugin());
 
 const RecaptchaPlugin = require("puppeteer-extra-plugin-recaptcha");
 puppeteer.use(RecaptchaPlugin());
@@ -76,14 +76,21 @@ export class RankTrackerWorker {
           // await this.delay(CONFIG.RETRY_DELAY_MS);
         }
 
-        currentProxy = this.proxyManager.getNextProxy();
-        if (!currentProxy) {
+        const proxyResult = this.proxyManager.getNextProxy();
+        if (!proxyResult.proxy) {
+          const waitTime = proxyResult.nextAvailableIn || 10000;
           console.log(
-            "No proxy available. Waiting 10 seconds before retrying..."
+            `No proxy available. Waiting ${Math.ceil(
+              waitTime / 1000
+            )} seconds before retrying... (Next available in: ${Math.ceil(
+              waitTime / 1000
+            )} seconds)`
           );
-          await this.delay(50000);
+          await this.delay(waitTime);
           retries++;
           continue;
+        } else {
+          currentProxy = proxyResult.proxy;
         }
         const { result: rankResult, captchaStats } =
           await this.checkKeywordRank(
@@ -174,7 +181,7 @@ export class RankTrackerWorker {
 
       const UndetectableBMS = new UndetectableBrowser(
         await puppeteer.launch({
-          headless: "shell",
+          headless: false,
           executablePath: process.env.BRAVE_PATH!,
           userDataDir: userDataDir,
           args: [

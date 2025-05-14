@@ -13,6 +13,7 @@ interface ProxyUsage {
   lastUsed: number;
   usageCount: number;
   cooldownUntil: number;
+  consecutiveDetections: number;
 }
 
 interface ProxyManagerOptions {
@@ -21,6 +22,10 @@ interface ProxyManagerOptions {
   rotationStrategy: "round-robin" | "least-used";
 }
 
+interface ProxyResult {
+  proxy: Proxy | null;
+  nextAvailableIn: number | null;
+}
 class ProxyManager {
   private proxies: Proxy[] = [];
   private proxyUsage: Map<string, ProxyUsage> = new Map();
@@ -52,6 +57,7 @@ class ProxyManager {
       lastUsed: 0,
       usageCount: 0,
       cooldownUntil: 0,
+      consecutiveDetections: 0,
     });
     return proxy;
   }
@@ -113,8 +119,7 @@ class ProxyManager {
    * Get the next available proxy based on the rotation strategy and rate limits
    * @returns A proxy object or null if no proxy is available
    */
-  public getNextProxy(): Proxy | null {
-    console.log(this.getAvailableProxies().length);
+  public getNextProxy(): ProxyResult {
     const now = Date.now();
     const availableProxies = this.proxies.filter((proxy) => {
       if (!proxy.isActive) return false;
@@ -138,7 +143,24 @@ class ProxyManager {
     });
 
     if (availableProxies.length === 0) {
-      return null;
+      let nextAvailableIn: number | null = null;
+
+      for (const usage of this.proxyUsage.values()) {
+        if (!usage.proxy.isActive) continue;
+
+        const timeUntilAvailable = usage.cooldownUntil - now;
+
+        if (timeUntilAvailable > 0) {
+          if (
+            nextAvailableIn === null ||
+            timeUntilAvailable < nextAvailableIn
+          ) {
+            nextAvailableIn = timeUntilAvailable;
+          }
+        }
+      }
+
+      return { proxy: null, nextAvailableIn };
     }
 
     let selectedProxy: Proxy | undefined;
@@ -174,7 +196,7 @@ class ProxyManager {
     usage.lastUsed = now;
     usage.usageCount++;
 
-    return selectedProxy;
+    return { proxy: selectedProxy, nextAvailableIn: null };
   }
 
   /**
@@ -186,6 +208,7 @@ class ProxyManager {
     if (usage) {
       usage.usageCount++;
       usage.lastUsed = Date.now();
+      this.resetConsecutiveDetections(proxyId);
     }
   }
 
@@ -197,11 +220,21 @@ class ProxyManager {
   public markProxyDetected(proxyId: string, cooldownPeriod?: number): void {
     const usage = this.proxyUsage.get(proxyId);
     if (usage) {
-      const period = cooldownPeriod || this.options.cooldownPeriod;
+      usage.consecutiveDetections++;
+      let period = cooldownPeriod || this.options.cooldownPeriod;
+      if (usage.consecutiveDetections >= 2) {
+        period = period * usage.consecutiveDetections;
+      }
+
       usage.cooldownUntil = Date.now() + period;
     }
   }
-
+  public resetConsecutiveDetections(proxyId: string): void {
+    const usage = this.proxyUsage.get(proxyId);
+    if (usage) {
+      usage.consecutiveDetections = 0;
+    }
+  }
   /**
    * Get all proxies with their current status
    * @returns Array of proxies with their usage statistics
