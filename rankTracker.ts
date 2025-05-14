@@ -12,12 +12,13 @@ puppeteer.use(StealthPlugin());
 
 const RecaptchaPlugin = require("puppeteer-extra-plugin-recaptcha");
 puppeteer.use(RecaptchaPlugin());
-
+const AnonymizeUA = require("puppeteer-extra-plugin-anonymize-ua");
+puppeteer.use(AnonymizeUA({ customFn: (ua: any) => ua }));
 const CONFIG = {
   BASE_DELAY_MS: 2000,
   MAX_PAGES_TO_CHECK: 1,
   RESULTS_PER_PAGE: 100,
-  MAX_RETRIES: Infinity,
+  MAX_RETRIES: 10,
   USER_AGENTS: [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -68,14 +69,9 @@ export class RankTrackerWorker {
     let result: RankResult | null = null;
     let currentProxy: any = null;
 
-    while (!result) {
+    while (!result && retries < CONFIG.MAX_RETRIES) {
       try {
-        if (retries > 0) {
-          console.log(`Retry ${retries} for "${keyword}"`);
-          // await this.delay(CONFIG.RETRY_DELAY_MS * Math.pow(2, retries - 1));
-          // await this.delay(CONFIG.RETRY_DELAY_MS);
-        }
-
+        console.log(`Retry ${retries} for "${keyword}"`);
         const proxyResult = this.proxyManager.getNextProxy();
         if (!proxyResult.proxy) {
           const waitTime = proxyResult.nextAvailableIn || 10000;
@@ -254,9 +250,20 @@ export class RankTrackerWorker {
         throw new Error("Failed to create browser");
       }
       page = await browser.newPage();
+
       await page.authenticate({
         username: proxy.username!,
         password: proxy.password!,
+      });
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => false });
+        Object.defineProperty(navigator, "languages", {
+          get: () => ["en-US", "en"],
+        });
+        Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+        Object.defineProperty(navigator, "vendor", {
+          get: () => "Google Inc.",
+        });
       });
       await this.randomDelay();
       console.log("URL:", searchUrl);
@@ -450,7 +457,6 @@ export class RankTrackerWorker {
       );
     }) as any);
   }
-  // ... existing code ...
   private async detectAndHandleCaptcha(page: Page): Promise<{
     solved: number;
     errors: number;
