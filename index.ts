@@ -6,7 +6,7 @@ import { parse } from "csv-parse/sync";
 import * as nodemailer from "nodemailer";
 
 const proxyManager = new ProxyManager({
-  requestsPerMinute: 3,
+  requestsPerMinute: Number(process.env.PROXY_REQUEST_PER_MIN) || 3,
   cooldownPeriod: 180000,
 });
 const proxyAuth = {
@@ -134,7 +134,7 @@ function readKeywordsFromCSV() {
 
 async function processKeywords() {
   const keywords = readKeywordsFromCSV();
-  const maxConcurrentSlots = 1;
+  const maxConcurrentSlots = Number(process.env.MAX_SLOTS) || 1;
   const taskDelay = 10000;
 
   const startTime = new Date().toISOString();
