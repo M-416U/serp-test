@@ -94,7 +94,7 @@ export class DriverManager {
         "--disable-blink-features=AutomationControlled",
         "--disable-infobars",
         "--start-maximized",
-        // "--headless=new",
+        "--headless=new",
         "--log-level=3",
         "--silent"
       );
