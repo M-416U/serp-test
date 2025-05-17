@@ -31,7 +31,10 @@ export interface RankJobData {
    */
   deviceType?: "desktop" | "mobile";
 }
-
+export interface CaptchaStats {
+  solved: number;
+  errors: number;
+}
 /**
  * Result of a rank checking operation
  */

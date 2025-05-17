@@ -13,7 +13,7 @@ puppeteer.use(StealthPlugin());
 const RecaptchaPlugin = require("puppeteer-extra-plugin-recaptcha");
 puppeteer.use(RecaptchaPlugin());
 const AnonymizeUA = require("puppeteer-extra-plugin-anonymize-ua");
-puppeteer.use(AnonymizeUA({ customFn: (ua: any) => ua }));
+// puppeteer.use(AnonymizeUA({ customFn: (ua: any) => ua }));
 const CONFIG = {
   BASE_DELAY_MS: 2000,
   MAX_PAGES_TO_CHECK: 1,
@@ -41,6 +41,9 @@ const CONFIG = {
 export class RankTrackerWorker {
   private proxyManager: ProxyManager;
   private statsFile: string;
+  private browserPool: Map<string, any> = new Map();
+  private maxBrowserAge: number = 300000; // 5min
+  private browserCreationTimes: Map<string, number> = new Map();
 
   constructor(proxyManager: ProxyManager) {
     this.proxyManager = proxyManager;
@@ -164,8 +167,35 @@ export class RankTrackerWorker {
     const viewportIndex = Math.floor(
       Math.random() * CONFIG.VIEWPORT_WIDTHS.length
     );
+    const browserKey = `${proxy.id}`;
+    const existingBrowser = this.browserPool.get(browserKey);
+    const creationTime = this.browserCreationTimes.get(browserKey) || 0;
+    const browserAge = Date.now() - creationTime;
+
+    if (existingBrowser && browserAge < this.maxBrowserAge) {
+      try {
+        const pages = await existingBrowser.pages();
+        if (pages.length > 0) {
+          return existingBrowser;
+        }
+      } catch (err) {
+        console.log(
+          `Browser for proxy ${proxy.id} is no longer usable, creating new one`
+        );
+        this.closeBrowser(browserKey);
+      }
+    } else if (existingBrowser) {
+      console.log(
+        `Browser for proxy ${proxy.id} is too old (${Math.round(
+          browserAge / 1000
+        )}s), creating new one`
+      );
+      this.closeBrowser(browserKey);
+    }
+
     try {
-      const uniqueId = proxy.id;
+      // const uniqueId = proxy.id;
+      const uniqueId = Math.floor(Math.random() * 1000000);
       const userDataDir = path.join(
         process.cwd(),
         `browser_profiles/profile_${uniqueId}`
@@ -177,47 +207,116 @@ export class RankTrackerWorker {
 
       const UndetectableBMS = new UndetectableBrowser(
         await puppeteer.launch({
-          headless: true,
+          headless: false,
           executablePath: process.env.BRAVE_PATH!,
           userDataDir: userDataDir,
+          protocolTimeout: 60000,
           args: [
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-blink-features=AutomationControlled",
             `--proxy-server=${proxy.host}:${proxy.port}`,
+            // "--disable-dev-shm-usage",
+            // "--disable-gpu",
+            // "--disable-extensions",
+            // "--disable-background-networking",
+            // "--disable-default-apps",
+            // "--no-zygote",
+            // "--mute-audio",
           ],
         })
       );
       const browser = await UndetectableBMS.getBrowser();
+
+      this.browserPool.set(browserKey, browser);
+      this.browserCreationTimes.set(browserKey, Date.now());
+
       return browser;
     } catch (error: any) {
-      const uniqueId = Math.floor(Math.random() * 1000000);
-      const userDataDir = path.join(
-        process.cwd(),
-        `browser_profiles/profile_no_proxy_${uniqueId}`
-      );
-
-      if (!fs.existsSync(path.dirname(userDataDir))) {
-        fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
-      }
-
-      const UndetectableBMS = new UndetectableBrowser(
-        await puppeteer.launch({
-          headless: false,
-          executablePath: process.env.BRAVE_PATH!,
-          userDataDir: userDataDir,
-          args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            //  `--proxy-server=${proxy.host}:${proxy.port}`,
-          ],
-        })
-      );
-      const browser = await UndetectableBMS.getBrowser();
-      console.error(`Error creating proxy: ${error.message}`);
+      console.error(`Error creating proxy browser: ${error.message}`);
       console.log("Falling back to direct connection without proxy");
-      return browser;
+
+      try {
+        const uniqueId = Math.floor(Math.random() * 1000000);
+        const userDataDir = path.join(
+          process.cwd(),
+          `browser_profiles/profile_no_proxy_${uniqueId}`
+        );
+
+        if (!fs.existsSync(path.dirname(userDataDir))) {
+          fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
+        }
+
+        const UndetectableBMS = new UndetectableBrowser(
+          await puppeteer.launch({
+            headless: false,
+            executablePath: process.env.BRAVE_PATH!,
+            userDataDir: userDataDir,
+            protocolTimeout: 60000,
+            args: [
+              // "--no-sandbox",
+              // "--disable-setuid-sandbox",
+              // "--disable-blink-features=AutomationControlled",
+              // "--disable-dev-shm-usage",
+              // "--disable-gpu",
+              // "--disable-extensions",
+              // "--disable-background-networking",
+              // "--disable-default-apps",
+              // "--no-zygote",
+              // "--mute-audio",
+            ],
+          })
+        );
+        const browser = await UndetectableBMS.getBrowser();
+        return browser;
+      } catch (fallbackError: any) {
+        console.error(
+          `Error creating fallback browser: ${fallbackError.message}`
+        );
+        throw new Error(
+          `Failed to create any browser: ${error.message}, fallback error: ${fallbackError.message}`
+        );
+      }
+    }
+  }
+  private async closeBrowser(browserKey: string): Promise<void> {
+    const browser = this.browserPool.get(browserKey);
+    if (browser) {
+      try {
+        const pages = await browser.pages().catch(() => []);
+        for (const page of pages) {
+          await page
+            .close()
+            .catch((err: any) =>
+              console.warn(`Error closing page: ${err.message}`)
+            );
+        }
+
+        await browser
+          .close()
+          .catch((err: any) =>
+            console.warn(`Error closing browser: ${err.message}`)
+          );
+
+        this.browserPool.delete(browserKey);
+        this.browserCreationTimes.delete(browserKey);
+
+        try {
+          const profileDirMatch = /browser_profiles\/profile_\d+/.exec(
+            browser?.process()?.spawnargs?.join(" ") || ""
+          );
+          if (profileDirMatch && profileDirMatch[0]) {
+            const profileDir = path.join(process.cwd(), profileDirMatch[0]);
+            if (fs.existsSync(profileDir)) {
+              fs.rmSync(profileDir, { recursive: true, force: true });
+            }
+          }
+        } catch (err: any) {
+          console.warn(`Could not remove profile directory: ${err.message}`);
+        }
+      } catch (err: any) {
+        console.warn(`Error during browser cleanup: ${err.message}`);
+      }
     }
   }
 
@@ -250,7 +349,18 @@ export class RankTrackerWorker {
         throw new Error("Failed to create browser");
       }
       page = await browser.newPage();
-
+      // const viewportWidth =
+      //   CONFIG.VIEWPORT_WIDTHS[
+      //     Math.floor(Math.random() * CONFIG.VIEWPORT_WIDTHS.length)
+      //   ] || 1920;
+      // const viewportHeight =
+      //   CONFIG.VIEWPORT_HEIGHTS[
+      //     Math.floor(Math.random() * CONFIG.VIEWPORT_HEIGHTS.length)
+      //   ] || 1080;
+      // await page.setViewport({ width: viewportWidth, height: viewportHeight });
+      // page.setUserAgent(
+      //   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+      // );
       await page.authenticate({
         username: proxy.username!,
         password: proxy.password!,
@@ -282,7 +392,6 @@ export class RankTrackerWorker {
         return null;
       }
 
-      await this.randomDelay();
       const results = await this.extractSearchResults(page);
       let rank = 0;
       let rankUrl = "null";
@@ -338,41 +447,13 @@ export class RankTrackerWorker {
     } catch (error: any) {
       throw new Error(`Failed to check rank: ${error.message}`);
     } finally {
-      if (browser) {
+      if (page) {
         try {
-          // Safely close all pages first
-          const pages = await browser.pages().catch(() => []);
-          for (const page of pages) {
-            await page
-              .close()
-              .catch((err) =>
-                console.warn(`Error closing page: ${err.message}`)
-              );
-          }
-
-          // Then close the browser
-          await browser
+          await page
             .close()
-            .catch((err) =>
-              console.warn(`Error closing browser: ${err.message}`)
-            );
-
-          // Clean up browser profile directory if possible
-          try {
-            const profileDirMatch = /browser_profiles\/profile_\d+/.exec(
-              browser?.process()?.spawnargs?.join(" ") || ""
-            );
-            if (profileDirMatch && profileDirMatch[0]) {
-              const profileDir = path.join(process.cwd(), profileDirMatch[0]);
-              if (fs.existsSync(profileDir)) {
-                fs.rmSync(profileDir, { recursive: true, force: true });
-              }
-            }
-          } catch (err: any) {
-            console.warn(`Could not remove profile directory: ${err.message}`);
-          }
-        } catch (err: any) {
-          console.warn(`Error during browser cleanup: ${err.message}`);
+            .catch((err) => console.warn(`Error closing page: ${err.message}`));
+        } catch (err) {
+          console.warn(`Error closing page: ${err}`);
         }
       }
     }

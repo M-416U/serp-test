@@ -1,11 +1,14 @@
 import path from "path";
 import ProxyManager from "./proxyManager.ts";
-import { RankTrackerWorker } from "./rankTracker";
+import { SeleniumRankTracker } from "./seleniumRankTracker.ts";
 import * as fs from "fs";
 import { parse } from "csv-parse/sync";
 import * as nodemailer from "nodemailer";
 
-const proxyManager = new ProxyManager();
+const proxyManager = new ProxyManager({
+  requestsPerMinute: 3,
+  cooldownPeriod: 180000,
+});
 const proxyAuth = {
   username: process.env.PROXY_AUTH_USERNAME || "",
   password: process.env.PROXY_AUTH_PASSWORD || "",
@@ -85,7 +88,7 @@ proxies.forEach((proxy, index) => {
   });
 });
 
-const rankTrackerWorker = new RankTrackerWorker(proxyManager);
+const rankTrackerWorker = new SeleniumRankTracker(proxyManager);
 
 // Email configuration
 const emailTransporter = nodemailer.createTransport({
@@ -121,31 +124,27 @@ function readKeywordsFromCSV() {
     skip_empty_lines: true,
   });
 
-  return records.map((record: any) => ({
-    keyword: record["Top queries"],
-    target: "http://www.shub.coffee/",
-  }));
+  return records
+    .map((record: any) => ({
+      keyword: record["Top queries"],
+      target: "http://www.shub.coffee/",
+    }))
+    .splice(0, 200);
 }
 
 async function processKeywords() {
   const keywords = readKeywordsFromCSV();
-  const allResults = [];
-  const batchSize = 5; // 5 keywords per minute
-  const batchDelay = 60000; // 1 minute in milliseconds
-
-  const batches = [];
-  for (let i = 0; i < keywords.length; i += batchSize) {
-    batches.push(keywords.slice(i, i + batchSize));
-  }
+  const maxConcurrentSlots = 1;
+  const taskDelay = 10000;
 
   const startTime = new Date().toISOString();
   const startEmailContent = `
     <h2>Keyword Tracking Process Started</h2>
     <p><strong>Start Time:</strong> ${startTime}</p>
     <p><strong>Total Keywords:</strong> ${keywords.length}</p>
-    <p><strong>Number of Batches:</strong> ${batches.length}</p>
+    <p><strong>Concurrent Slots:</strong> ${maxConcurrentSlots}</p>
     <p><strong>Target Website:</strong> http://www.shub.coffee/</p>
-    <p><strong>Batch Size:</strong> ${batchSize} keywords per minute</p>
+    <p><strong>Task Delay:</strong> ${taskDelay / 1000} seconds</p>
   `;
   await sendEmailNotification(
     "Keyword Tracking Process Started",
@@ -153,57 +152,80 @@ async function processKeywords() {
   );
 
   console.log(
-    `Processing ${keywords.length} keywords in ${batches.length} batches (5 keywords per minute)...`
+    `Processing ${keywords.length} keywords using ${maxConcurrentSlots} concurrent slots...`
   );
 
-  for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-    const batch = batches[batchIndex];
-    console.log(
-      `Starting batch ${batchIndex + 1}/${batches.length} with ${
-        batch.length
-      } keywords`
-    );
+  const keywordQueue = [...keywords];
+  const activeSlots = new Set();
+  const results: any[] = [];
 
-    const batchTasks = batch.map((item: any) => {
-      return rankTrackerWorker.processJob({
-        data: {
-          keyword: item.keyword,
-          domain: new URL(item.target).hostname,
-          location: "us",
-        },
-      });
-    });
+  async function processKeywordInSlot(slotId: number) {
+    while (keywordQueue.length > 0) {
+      const item = keywordQueue.shift();
+      if (!item) break;
 
-    try {
-      const batchResults = await Promise.all(batchTasks);
-      allResults.push(...batchResults);
-      console.log(`Completed batch ${batchIndex + 1}/${batches.length}`);
+      console.log(`[Slot ${slotId}] Processing keyword: "${item.keyword}"`);
 
-      if (batchIndex < batches.length - 1) {
-        console.log(`Waiting 60 seconds before starting next batch...`);
-        await new Promise((resolve) => setTimeout(resolve, batchDelay));
+      try {
+        const result = await rankTrackerWorker.processJob({
+          data: {
+            keyword: item.keyword,
+            domain: new URL(item.target).hostname,
+            location: "us",
+          },
+        });
+
+        results.push(result);
+        console.log(
+          `[Slot ${slotId}] Completed keyword: "${item.keyword}", remains: ${keywordQueue.length}`
+        );
+
+        if (keywordQueue.length > 0) {
+          await new Promise((resolve) => setTimeout(resolve, taskDelay));
+        }
+      } catch (error) {
+        console.error(
+          `[Slot ${slotId}] Error processing keyword "${item.keyword}":`,
+          error
+        );
       }
-    } catch (error) {
-      console.error(`Error processing batch ${batchIndex + 1}:`, error);
+    }
+
+    activeSlots.delete(slotId);
+    console.log(`[Slot ${slotId}] Finished all assigned keywords`);
+
+    if (activeSlots.size === 0) {
+      const endTime = new Date().toISOString();
+      const completionEmailContent = `
+        <h2>Keyword Tracking Process Completed</h2>
+        <p><strong>Start Time:</strong> ${startTime}</p>
+        <p><strong>End Time:</strong> ${endTime}</p>
+        <p><strong>Total Keywords Processed:</strong> ${keywords.length}</p>
+        <p><strong>Results Count:</strong> ${results.length}</p>
+        <p><strong>Target Website:</strong> http://www.shub.coffee/</p>
+      `;
+      await sendEmailNotification(
+        "Keyword Tracking Process Completed",
+        completionEmailContent
+      );
+
+      console.log("All keywords have been processed");
     }
   }
 
-  const endTime = new Date().toISOString();
-  const completionEmailContent = `
-    <h2>Keyword Tracking Process Completed</h2>
-    <p><strong>Start Time:</strong> ${startTime}</p>
-    <p><strong>End Time:</strong> ${endTime}</p>
-    <p><strong>Total Keywords Processed:</strong> ${keywords.length}</p>
-    <p><strong>Results Count:</strong> ${allResults.length}</p>
-    <p><strong>Target Website:</strong> http://www.shub.coffee/</p>
-  `;
-  await sendEmailNotification(
-    "Keyword Tracking Process Completed",
-    completionEmailContent
-  );
+  const slotPromises = [];
+  for (let i = 0; i < Math.min(maxConcurrentSlots, keywords.length); i++) {
+    const slotId = i + 1;
+    activeSlots.add(slotId);
 
-  console.log("All keywords have been processed");
-  return allResults;
+    await new Promise((resolve) => setTimeout(resolve, i * 1000));
+
+    slotPromises.push(processKeywordInSlot(slotId));
+  }
+
+  await Promise.all(slotPromises);
+
+  return results;
 }
 
 process.on("exit", () => {
@@ -221,18 +243,15 @@ process.on("exit", () => {
   }
 });
 
-// Add handlers for other termination signals
 ["SIGINT", "SIGTERM", "SIGHUP"].forEach((signal) => {
   process.on(signal, () => {
     console.log(`Received ${signal}, cleaning up...`);
     try {
-      // Clean up browser profiles
       const profilesDir = path.join(process.cwd(), "browser_profiles");
       if (fs.existsSync(profilesDir)) {
         fs.rmSync(profilesDir, { recursive: true, force: true });
       }
 
-      // Exit process
       process.exit(0);
     } catch (error: any) {
       console.error(`Error during ${signal} cleanup: ${error.message}`);
