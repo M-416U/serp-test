@@ -6,10 +6,12 @@ import * as path from "path";
 import { randomBytes } from "crypto";
 import { CONFIG } from "./config";
 require("chromedriver-undetected");
+
 export class DriverManager {
   private driverPool: Map<string, WebDriver> = new Map();
   private maxDriverAge: number = 300000;
   private driverCreationTimes: Map<string, number> = new Map();
+  private driverProfileDirs: Map<string, string> = new Map();
 
   public async getDriver(proxyConfig: any = null): Promise<WebDriver> {
     try {
@@ -28,18 +30,28 @@ export class DriverManager {
         this.driverPool.delete(driverKey);
         this.driverCreationTimes.delete(driverKey);
 
-        try {
-          const profileDirMatch = /selenium_profiles\/profile_[a-f0-9]+/.exec(
-            driverKey
-          );
-          if (profileDirMatch && profileDirMatch[0]) {
-            const profileDir = path.join(process.cwd(), profileDirMatch[0]);
+        const profileDir = this.driverProfileDirs.get(driverKey);
+        if (profileDir) {
+          try {
+            console.log(`Removing profile directory: ${profileDir}`);
             if (fs.existsSync(profileDir)) {
               fs.rmSync(profileDir, { recursive: true, force: true });
+              console.log(
+                `Successfully removed profile directory: ${profileDir}`
+              );
+            } else {
+              console.log(`Profile directory does not exist: ${profileDir}`);
             }
+            this.driverProfileDirs.delete(driverKey);
+          } catch (err: any) {
+            console.warn(
+              `Could not remove profile directory ${profileDir}: ${err.message}`
+            );
           }
-        } catch (err: any) {
-          console.warn(`Could not remove profile directory: ${err.message}`);
+        } else {
+          console.log(
+            `No profile directory found for driver key: ${driverKey}`
+          );
         }
       } catch (err: any) {
         console.warn(`Error during driver cleanup: ${err.message}`);
@@ -147,6 +159,7 @@ export class DriverManager {
 
       this.driverPool.set(driverKey, driver);
       this.driverCreationTimes.set(driverKey, Date.now());
+      this.driverProfileDirs.set(driverKey, userDataDir);
 
       await this.addAntiDetectionMeasures(driver);
 
@@ -195,6 +208,13 @@ export class DriverManager {
       `);
     } catch (error: any) {
       console.warn(`Failed to add anti-detection measures: ${error.message}`);
+    }
+  }
+
+  public async closeAllDrivers(): Promise<void> {
+    const driverKeys = Array.from(this.driverPool.keys());
+    for (const key of driverKeys) {
+      await this.closeDriver(key);
     }
   }
 }

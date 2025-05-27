@@ -32,6 +32,7 @@ export class SeleniumRankTracker {
   }
 
   public async processJob(job: { data: RankJobData }) {
+    const startTime = Date.now();
     const { keyword, domain, location, language, deviceType } = job.data;
     let errors: string[] = [];
     let searchUrl = "";
@@ -155,6 +156,8 @@ export class SeleniumRankTracker {
         proxy: usedProxyId,
       });
     }
+    const duration = Date.now() - startTime;
+    console.log(`Job completed in ${duration}ms`);
     return result;
   }
 
@@ -252,6 +255,16 @@ export class SeleniumRankTracker {
       };
     } catch (error: any) {
       throw new Error(`Failed to check rank: ${error.message}`);
+    } finally {
+      if (driver) {
+        try {
+          await this.driverManager.closeDriver(
+            proxyConfig ? `proxy_${proxyConfig.id}` : "default_driver"
+          );
+        } catch (error) {
+          console.error("Error during driver cleanup:", error);
+        }
+      }
     }
   }
 }

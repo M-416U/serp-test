@@ -17,60 +17,120 @@ const proxies = [
   {
     host: "isp.oxylabs.io",
     port: 8001,
-    ip: "45.196.46.34",
+    ip: "45.196.45.157",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8002,
-    ip: "45.196.59.123",
+    ip: "45.196.46.140",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8003,
-    ip: "45.196.59.14",
+    ip: "45.196.46.34",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8004,
-    ip: "45.196.59.170",
+    ip: "45.196.47.201",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8005,
-    ip: "45.196.59.90",
+    ip: "45.196.59.123",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8006,
-    ip: "69.46.65.248",
+    ip: "45.196.59.14",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8007,
-    ip: "198.145.51.11",
+    ip: "45.196.59.170",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8008,
-    ip: "50.117.28.85",
+    ip: "45.196.59.46",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8009,
-    ip: "50.117.28.91",
+    ip: "45.196.59.90",
     location: "us",
   },
   {
     host: "isp.oxylabs.io",
     port: 8010,
+    ip: "50.117.73.1",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8011,
+    ip: "69.46.65.248",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8012,
+    ip: "198.145.48.192",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8013,
+    ip: "198.145.51.11",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8014,
+    ip: "66.180.131.65",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8015,
+    ip: "50.117.28.85",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8016,
+    ip: "50.117.28.91",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8017,
+    ip: "45.196.44.124",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8018,
+    ip: "45.196.44.18",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8019,
+    ip: "45.196.44.40",
+    location: "us",
+  },
+  {
+    host: "isp.oxylabs.io",
+    port: 8020,
     ip: "45.196.44.42",
     location: "us",
   },
@@ -136,7 +196,12 @@ async function processKeywords() {
   const keywords = readKeywordsFromCSV();
   const maxConcurrentSlots = Number(process.env.MAX_SLOTS) || 1;
   const taskDelay = 10000;
-
+  const memoryUsage = process.memoryUsage();
+  if (memoryUsage.heapUsed / memoryUsage.heapTotal > 0.8) {
+    console.warn(
+      "High memory usage detected, consider reducing concurrent slots"
+    );
+  }
   const startTime = new Date().toISOString();
   const startEmailContent = `
     <h2>Keyword Tracking Process Started</h2>
