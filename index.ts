@@ -189,7 +189,7 @@ function readKeywordsFromCSV() {
       keyword: record["Top queries"],
       target: "http://www.shub.coffee/",
     }))
-    .splice(0, 200);
+    .splice(0, 100);
 }
 
 async function processKeywords() {
