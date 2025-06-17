@@ -12,8 +12,41 @@ export class DriverManager {
   private maxDriverAge: number = 300000;
   private driverCreationTimes: Map<string, number> = new Map();
   private driverProfileDirs: Map<string, string> = new Map();
+  private readonly profileBaseDir = path.join(process.cwd(), 'selenium_profiles');
+
+  constructor() {
+    this.cleanupOldProfiles();
+  }
+
+  private cleanupOldProfiles(maxAge: number =this.maxDriverAge * 2): void {
+    try {
+      if (!fs.existsSync(this.profileBaseDir)) {
+        return;
+      }
+
+      const now = Date.now();
+      const files = fs.readdirSync(this.profileBaseDir);
+
+      for (const file of files) {
+        const profilePath = path.join(this.profileBaseDir, file);
+        const stats = fs.statSync(profilePath);
+
+        if (now - stats.mtimeMs > maxAge) {
+          try {
+            fs.rmSync(profilePath, { recursive: true, force: true });
+            console.log(`Removed old profile directory: ${profilePath}`);
+          } catch (err: any) {
+            console.warn(`Failed to remove old profile: ${profilePath}, Error: ${err.message}`);
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error(`Error during profile cleanup: ${err.message}`);
+    }
+  }
 
   public async getDriver(proxyConfig: any = null): Promise<WebDriver> {
+    this.cleanupOldProfiles();
     try {
       return await this.createDriver(proxyConfig);
     } catch (error: any) {
@@ -68,27 +101,14 @@ export class DriverManager {
     const driverKey = proxyConfig
       ? `proxy_${proxyConfig.id}`
       : `default_driver`;
-    const existingDriver = this.driverPool.get(driverKey);
-    const creationTime = this.driverCreationTimes.get(driverKey) || 0;
-    const driverAge = Date.now() - creationTime;
-
-    if (existingDriver && driverAge < this.maxDriverAge) {
-      try {
-        await existingDriver.getTitle();
-        return existingDriver;
-      } catch (err) {
-        console.log(`Driver is no longer usable, creating new one`);
-        await this.closeDriver(driverKey);
-      }
-    } else if (existingDriver) {
-      console.log(
-        `Driver is too old (${Math.round(driverAge / 1000)}s), creating new one`
-      );
+    
+    // Force close any existing driver before creating a new one
+    if (this.driverPool.has(driverKey)) {
       await this.closeDriver(driverKey);
     }
 
     try {
-      const uniqueId = randomBytes(8).toString("hex");
+      const uniqueId = randomBytes(8).toString('hex');
       const userDataDir = path.join(
         process.cwd(),
         `selenium_profiles/profile_${uniqueId}`
@@ -98,7 +118,7 @@ export class DriverManager {
         fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
       }
 
-      // Set up Chrome options
+      // Chrome options
       const options = new Options();
       options.addArguments(
         "--no-sandbox",
@@ -108,7 +128,10 @@ export class DriverManager {
         "--start-maximized",
         "--headless=new",
         "--log-level=3",
-        "--silent"
+        "--silent",
+        "--disable-dev-shm-usage",  
+        "--disable-gpu",            
+        "--window-size=1920,1080"   
       );
       const loggingPrefs = new logging.Preferences();
       loggingPrefs.setLevel(logging.Type.BROWSER, logging.Level.OFF);

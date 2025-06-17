@@ -254,6 +254,7 @@ export class SeleniumRankTracker {
         },
       };
     } catch (error: any) {
+      
       throw new Error(`Failed to check rank: ${error.message}`);
     } finally {
       if (driver) {

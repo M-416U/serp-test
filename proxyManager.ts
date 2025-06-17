@@ -39,7 +39,7 @@ class ProxyManager {
   constructor(options: Partial<ProxyManagerOptions> = {}) {
     this.options = {
       requestsPerMinute: 2,
-      cooldownPeriod: 300000, // 3 min cooldown when detected
+      cooldownPeriod: 1200000, // 20 min
       rotationStrategy: "round-robin",
       ...options,
     };
@@ -141,7 +141,7 @@ class ProxyManager {
 
       return true;
     });
-
+    console.log("Available Proxies:",availableProxies.length)
     if (availableProxies.length === 0) {
       let nextAvailableIn: number | null = null;
 
