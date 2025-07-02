@@ -33,6 +33,9 @@ stats.csv
 
 # IntelliJ based IDEs
 .idea
+.qodo
 
 # Finder (MacOS) folder config
 .DS_Store
+
+rank_stats.csv

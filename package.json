@@ -19,6 +19,7 @@
     "install": "^0.13.0",
     "nodemailer": "^7.0.3",
     "p-limit": "^6.2.0",
+    "playwright": "^1.53.1",
     "proxy-chain": "^2.5.8",
     "puppeteer": "^24.8.2",
     "puppeteer-extra": "^3.3.6",

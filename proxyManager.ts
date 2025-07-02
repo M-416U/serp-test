@@ -1,4 +1,4 @@
-interface Proxy {
+export interface Proxy {
   id: string;
   host: string;
   port: number;
@@ -141,7 +141,7 @@ class ProxyManager {
 
       return true;
     });
-    console.log("Available Proxies:",availableProxies.length)
+    console.log("Available Proxies:", availableProxies.length);
     if (availableProxies.length === 0) {
       let nextAvailableIn: number | null = null;
 

@@ -15,9 +15,10 @@ export class SeleniumRankTracker {
   private captchaHandler: CaptchaHandler;
   private searchResultsParser: SearchResultsParser;
   private proxyManager: ProxyManager | null;
+  private maxConcurrentTabs: number;
 
-  constructor(proxyManager?: ProxyManager) {
-    this.statsFile = path.join(process.cwd(), "selenium_stats.csv");
+  constructor(proxyManager?: ProxyManager, maxConcurrentTabs: number = 5) {
+    this.statsFile = path.join(process.cwd(), "rank_stats.csv");
     if (!fs.existsSync(this.statsFile)) {
       fs.writeFileSync(
         this.statsFile,
@@ -26,12 +27,17 @@ export class SeleniumRankTracker {
     }
 
     this.proxyManager = proxyManager || null;
-    this.driverManager = new DriverManager();
+    this.maxConcurrentTabs = maxConcurrentTabs;
+    this.driverManager = new DriverManager(maxConcurrentTabs * 2);
     this.captchaHandler = new CaptchaHandler(process.env.CAPTCHA_API_KEY!);
     this.searchResultsParser = new SearchResultsParser();
   }
 
-  public async processJob(job: { data: RankJobData }) {
+  public async initialize(): Promise<void> {
+    await this.driverManager.initializeBrowser();
+  }
+
+  public async processJob(job: { data: RankJobData }): Promise<RankResult> {
     const startTime = Date.now();
     const { keyword, domain, location, language, deviceType } = job.data;
     let errors: string[] = [];
@@ -39,6 +45,7 @@ export class SeleniumRankTracker {
     let captchaSolved = 0;
     let captchaErrors = 0;
     let usedProxyId = "none";
+    let tabId: string | null = null;
 
     console.log(`Starting rank check for "${keyword}" on domain "${domain}"`);
 
@@ -75,7 +82,7 @@ export class SeleniumRankTracker {
             location!,
             language,
             deviceType,
-            proxyConfig
+            usedProxyId
           );
 
         captchaSolved += captchaStats.solved;
@@ -156,9 +163,10 @@ export class SeleniumRankTracker {
         proxy: usedProxyId,
       });
     }
+
     const duration = Date.now() - startTime;
     console.log(`Job completed in ${duration}ms`);
-    return result;
+    return result!;
   }
 
   private async checkKeywordRank(
@@ -167,28 +175,31 @@ export class SeleniumRankTracker {
     location: string,
     language: string = "en",
     deviceType: "desktop" | "mobile" = "desktop",
-    proxyConfig: any = null
+    proxyId: string = "default"
   ): Promise<{
     result: RankResult;
     captchaStats: CaptchaStats;
   }> {
     const searchUrl = buildGoogleSearchUrl(keyword, location, language);
+    let tabId: string | null = null;
     let driver: WebDriver | null = null;
     let captchaSolved = 0;
     let captchaErrors = 0;
 
     try {
-      // Make sure to pass the proxyConfig to getDriver
-      driver = await this.driverManager.getDriver(proxyConfig);
+      // Get a tab for this proxy
+      const tabResult = await this.driverManager.getTab(proxyId);
+      driver = tabResult.driver;
+      tabId = tabResult.tabId;
+
       if (!driver) {
-        throw new Error("Failed to create driver");
+        throw new Error("Failed to get driver/tab");
       }
 
       await randomDelay();
       console.log("URL:", searchUrl);
 
       await driver.get(searchUrl);
-
       await driver.wait(until.elementLocated(By.css("body")), 30000);
 
       const { solved, errors, shouldRetry } =
@@ -254,18 +265,92 @@ export class SeleniumRankTracker {
         },
       };
     } catch (error: any) {
-      
       throw new Error(`Failed to check rank: ${error.message}`);
     } finally {
-      if (driver) {
-        try {
-          await this.driverManager.closeDriver(
-            proxyConfig ? `proxy_${proxyConfig.id}` : "default_driver"
-          );
-        } catch (error) {
-          console.error("Error during driver cleanup:", error);
-        }
+      if (tabId) {
+        await this.driverManager.releaseTab(tabId);
       }
     }
+  }
+
+  public async processMultipleKeywords(
+    keywords: Array<{ keyword: string; domain: string; location: string }>
+  ): Promise<RankResult[]> {
+    await this.initialize();
+
+    const results: RankResult[] = [];
+    const activeJobs = new Map<string, Promise<RankResult>>();
+    let keywordIndex = 0;
+
+    const processNextKeyword = async (): Promise<void> => {
+      while (
+        keywordIndex < keywords.length &&
+        activeJobs.size < this.maxConcurrentTabs
+      ) {
+        const keywordData = keywords[keywordIndex]!;
+        const jobId = `job_${keywordIndex}`;
+        keywordIndex++;
+
+        console.log(
+          `Starting job ${jobId} for keyword: "${keywordData.keyword}"`
+        );
+
+        const jobPromise = this.processJob({
+          data: {
+            keyword: keywordData.keyword,
+            domain: keywordData.domain,
+            location: keywordData.location,
+            language: "en",
+            deviceType: "desktop",
+          },
+        })
+          .then((result) => {
+            results.push(result);
+            activeJobs.delete(jobId);
+            console.log(
+              `Completed job ${jobId}. Active jobs: ${
+                activeJobs.size
+              }, Remaining keywords: ${keywords.length - keywordIndex}`
+            );
+            return result;
+          })
+          .catch((error) => {
+            console.error(`Error in job ${jobId}:`, error);
+            activeJobs.delete(jobId);
+            throw error;
+          });
+
+        activeJobs.set(jobId, jobPromise);
+
+        // Add small delay between starting jobs to avoid overwhelming
+        await delay(1000);
+      }
+    };
+
+    // Process all keywords
+    while (keywordIndex < keywords.length || activeJobs.size > 0) {
+      await processNextKeyword();
+
+      if (activeJobs.size > 0) {
+        // Wait for at least one job to complete
+        await Promise.race(activeJobs.values());
+      }
+    }
+
+    // Wait for all remaining jobs to complete
+    if (activeJobs.size > 0) {
+      await Promise.all(activeJobs.values());
+    }
+
+    console.log(
+      `Processed ${
+        results.length
+      } keywords with ${this.driverManager.getTotalTabsCount()} tabs`
+    );
+    return results;
+  }
+
+  public async cleanup(): Promise<void> {
+    await this.driverManager.closeBrowser();
   }
 }

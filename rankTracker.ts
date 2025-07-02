@@ -1,104 +1,81 @@
-import ProxyManager from "./proxyManager";
-import type { RankResult } from "./types";
-import puppeteer from "puppeteer-extra";
-import { Browser, Page } from "puppeteer";
 import * as fs from "fs";
 import * as path from "path";
-const UndetectableBrowser = require("undetected-browser");
+import { DriverManager } from "./services/driverManager";
+import { CaptchaHandler } from "./services/captchaHandler";
+import { SearchResultsParser } from "./services/searchResultsParser";
+import type { CaptchaStats, RankJobData, RankResult } from "./types";
+import { CONFIG } from "./services/config";
+import { buildGoogleSearchUrl, delay, randomDelay } from "./services/helpers";
+import ProxyManager from "./proxyManager";
+import type { Page } from "playwright";
 
-// puppeteer extra plugins
-const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-puppeteer.use(StealthPlugin());
-
-const RecaptchaPlugin = require("puppeteer-extra-plugin-recaptcha");
-puppeteer.use(RecaptchaPlugin());
-const AnonymizeUA = require("puppeteer-extra-plugin-anonymize-ua");
-// puppeteer.use(AnonymizeUA({ customFn: (ua: any) => ua }));
-const CONFIG = {
-  BASE_DELAY_MS: 2000,
-  MAX_PAGES_TO_CHECK: 1,
-  RESULTS_PER_PAGE: 100,
-  MAX_RETRIES: 10,
-  USER_AGENTS: [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-  ],
-  BROWSER_TIMEOUT_MS: 600000, // 10 minuets
-  RETRY_DELAY_MS: 5000,
-  USE_AXIOS: false,
-  VIEWPORT_WIDTHS: [1366, 1440, 1536, 1920, 2560],
-  VIEWPORT_HEIGHTS: [768, 900, 864, 1080, 1440],
-  SCROLL_BEHAVIORS: ["smooth", "auto"],
-  CAPTCHA_API_KEY: process.env.CAPTCHA_API_KEY!,
-};
-
-export class RankTrackerWorker {
-  private proxyManager: ProxyManager;
+export class RankTracker {
   private statsFile: string;
-  private browserPool: Map<string, any> = new Map();
-  private maxBrowserAge: number = 300000; // 5min
-  private browserCreationTimes: Map<string, number> = new Map();
+  private driverManager: DriverManager;
+  private captchaHandler: CaptchaHandler;
+  private searchResultsParser: SearchResultsParser;
+  private proxyManager: ProxyManager | null;
 
-  constructor(proxyManager: ProxyManager) {
-    this.proxyManager = proxyManager;
-    this.statsFile = path.join(process.cwd(), "stats.csv");
+  constructor(proxyManager?: ProxyManager) {
+    this.statsFile = path.join(process.cwd(), "rank_stats.csv");
     if (!fs.existsSync(this.statsFile)) {
       fs.writeFileSync(
         this.statsFile,
-        "keyword,target,rank,url,tries,errors,proxy,searchUrl,captcha_solved,captcha_errors\n"
+        "keyword,target,rank,url,tries,errors,searchUrl,captcha_solved,captcha_errors,proxy\n"
       );
     }
+
+    this.proxyManager = proxyManager || null;
+    this.driverManager = new DriverManager();
+    this.captchaHandler = new CaptchaHandler(process.env.CAPTCHA_API_KEY!);
+    this.searchResultsParser = new SearchResultsParser();
   }
-  private getRandomUserAgent(): string {
-    const index = Math.floor(Math.random() * CONFIG.USER_AGENTS.length);
-    return CONFIG.USER_AGENTS[index] || "";
-  }
-  public async processJob(job: any) {
+
+  public async processJob(job: { data: RankJobData }) {
+    const startTime = Date.now();
     const { keyword, domain, location, language, deviceType } = job.data;
     let errors: string[] = [];
     let searchUrl = "";
     let captchaSolved = 0;
     let captchaErrors = 0;
+    let usedProxyId = "none";
 
     console.log(`Starting rank check for "${keyword}" on domain "${domain}"`);
 
     let retries = 0;
     let result: RankResult | null = null;
-    let currentProxy: any = null;
 
     while (!result && retries < CONFIG.MAX_RETRIES) {
       try {
         console.log(`Retry ${retries} for "${keyword}"`);
-        const proxyResult = this.proxyManager.getNextProxy();
-        if (!proxyResult.proxy) {
-          const waitTime = proxyResult.nextAvailableIn || 10000;
-          console.log(
-            `No proxy available. Waiting ${Math.ceil(
-              waitTime / 1000
-            )} seconds before retrying... (Next available in: ${Math.ceil(
-              waitTime / 1000
-            )} seconds)`
-          );
-          await this.delay(waitTime);
-          retries++;
-          continue;
-        } else {
-          currentProxy = proxyResult.proxy;
+
+        let proxyConfig = null;
+        if (this.proxyManager) {
+          const proxyResult = this.proxyManager.getNextProxy();
+          proxyConfig = proxyResult.proxy;
+
+          if (!proxyConfig) {
+            const waitTime = proxyResult.nextAvailableIn || 5000;
+            console.log(
+              `No proxy available. Waiting ${waitTime}ms before retry...`
+            );
+            await delay(waitTime);
+            retries++;
+            continue;
+          }
+
+          usedProxyId = proxyConfig.id;
+          console.log(`Using proxy: ${proxyConfig.host}:${proxyConfig.port}`);
         }
+
         const { result: rankResult, captchaStats } =
           await this.checkKeywordRank(
             keyword,
             domain,
-            currentProxy,
-            location,
+            location!,
             language,
-            deviceType
+            deviceType,
+            proxyConfig
           );
 
         captchaSolved += captchaStats.solved;
@@ -114,16 +91,30 @@ export class RankTrackerWorker {
           throw new Error(`Rank is 0 for keyword "${keyword}"`);
         }
 
-        searchUrl = this.buildGoogleSearchUrl(keyword, location, language);
-        this.proxyManager.markProxyUsed(currentProxy.id);
+        if (this.proxyManager && proxyConfig) {
+          this.proxyManager.markProxyUsed(proxyConfig.id);
+        }
+
+        searchUrl = buildGoogleSearchUrl(keyword, location!, language!);
       } catch (error: any) {
-        this.proxyManager.markProxyDetected(currentProxy.id);
         errors.push(error.message);
         retries++;
         console.error(`Error checking rank for "${keyword}": ${error.message}`);
-        if (retries > 1000) {
+
+        if (
+          this.proxyManager &&
+          usedProxyId !== "none" &&
+          (error.message.includes("captcha") ||
+            error.message.includes("detected"))
+        ) {
+          this.proxyManager.markProxyDetected(usedProxyId);
+        }
+
+        await delay(CONFIG.RETRY_DELAY_MS);
+
+        if (retries >= CONFIG.MAX_RETRIES) {
           console.log(
-            `[WARNING] Reached maximum retries (1000) for keyword "${keyword}". Saving with null rank.`
+            `[WARNING] Reached maximum retries (${CONFIG.MAX_RETRIES}) for keyword "${keyword}". Saving with null rank.`
           );
           result = {
             keyword,
@@ -149,250 +140,207 @@ export class RankTrackerWorker {
           result.url || "",
           retries,
           errors.join("|"),
-          `${currentProxy?.host}:${currentProxy?.port}`,
           searchUrl,
           captchaSolved,
           captchaErrors,
+          usedProxyId,
         ]
           .map((item) => `"${String(item).replace(/"/g, '""')}"`)
           .join(",") + "\n";
 
       fs.appendFileSync(this.statsFile, statsLine);
-      console.log({ ...result, captchaSolved, captchaErrors });
+      console.log({
+        ...result,
+        captchaSolved,
+        captchaErrors,
+        proxy: usedProxyId,
+      });
     }
+    const duration = Date.now() - startTime;
+    console.log(`Job completed in ${duration}ms`);
     return result;
   }
-
-  private async createBrowser(proxy: any): Promise<any> {
-    const viewportIndex = Math.floor(
-      Math.random() * CONFIG.VIEWPORT_WIDTHS.length
-    );
-    const browserKey = `${proxy.id}`;
-    const existingBrowser = this.browserPool.get(browserKey);
-    const creationTime = this.browserCreationTimes.get(browserKey) || 0;
-    const browserAge = Date.now() - creationTime;
-
-    if (existingBrowser && browserAge < this.maxBrowserAge) {
-      try {
-        const pages = await existingBrowser.pages();
-        if (pages.length > 0) {
-          return existingBrowser;
-        }
-      } catch (err) {
-        console.log(
-          `Browser for proxy ${proxy.id} is no longer usable, creating new one`
-        );
-        this.closeBrowser(browserKey);
-      }
-    } else if (existingBrowser) {
-      console.log(
-        `Browser for proxy ${proxy.id} is too old (${Math.round(
-          browserAge / 1000
-        )}s), creating new one`
-      );
-      this.closeBrowser(browserKey);
-    }
-
-    try {
-      // const uniqueId = proxy.id;
-      const uniqueId = Math.floor(Math.random() * 1000000);
-      const userDataDir = path.join(
-        process.cwd(),
-        `browser_profiles/profile_${uniqueId}`
-      );
-
-      if (!fs.existsSync(path.dirname(userDataDir))) {
-        fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
-      }
-
-      const UndetectableBMS = new UndetectableBrowser(
-        await puppeteer.launch({
-          headless: false,
-          executablePath: process.env.BRAVE_PATH!,
-          userDataDir: userDataDir,
-          protocolTimeout: 60000,
-          args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            `--proxy-server=${proxy.host}:${proxy.port}`,
-            // "--disable-dev-shm-usage",
-            // "--disable-gpu",
-            // "--disable-extensions",
-            // "--disable-background-networking",
-            // "--disable-default-apps",
-            // "--no-zygote",
-            // "--mute-audio",
-          ],
-        })
-      );
-      const browser = await UndetectableBMS.getBrowser();
-
-      this.browserPool.set(browserKey, browser);
-      this.browserCreationTimes.set(browserKey, Date.now());
-
-      return browser;
-    } catch (error: any) {
-      console.error(`Error creating proxy browser: ${error.message}`);
-      console.log("Falling back to direct connection without proxy");
-
-      try {
-        const uniqueId = Math.floor(Math.random() * 1000000);
-        const userDataDir = path.join(
-          process.cwd(),
-          `browser_profiles/profile_no_proxy_${uniqueId}`
-        );
-
-        if (!fs.existsSync(path.dirname(userDataDir))) {
-          fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
-        }
-
-        const UndetectableBMS = new UndetectableBrowser(
-          await puppeteer.launch({
-            headless: false,
-            executablePath: process.env.BRAVE_PATH!,
-            userDataDir: userDataDir,
-            protocolTimeout: 60000,
-            args: [
-              // "--no-sandbox",
-              // "--disable-setuid-sandbox",
-              // "--disable-blink-features=AutomationControlled",
-              // "--disable-dev-shm-usage",
-              // "--disable-gpu",
-              // "--disable-extensions",
-              // "--disable-background-networking",
-              // "--disable-default-apps",
-              // "--no-zygote",
-              // "--mute-audio",
-            ],
-          })
-        );
-        const browser = await UndetectableBMS.getBrowser();
-        return browser;
-      } catch (fallbackError: any) {
-        console.error(
-          `Error creating fallback browser: ${fallbackError.message}`
-        );
-        throw new Error(
-          `Failed to create any browser: ${error.message}, fallback error: ${fallbackError.message}`
-        );
-      }
-    }
-  }
-  private async closeBrowser(browserKey: string): Promise<void> {
-    const browser = this.browserPool.get(browserKey);
-    if (browser) {
-      try {
-        const pages = await browser.pages().catch(() => []);
-        for (const page of pages) {
-          await page
-            .close()
-            .catch((err: any) =>
-              console.warn(`Error closing page: ${err.message}`)
-            );
-        }
-
-        await browser
-          .close()
-          .catch((err: any) =>
-            console.warn(`Error closing browser: ${err.message}`)
-          );
-
-        this.browserPool.delete(browserKey);
-        this.browserCreationTimes.delete(browserKey);
-
-        try {
-          const profileDirMatch = /browser_profiles\/profile_\d+/.exec(
-            browser?.process()?.spawnargs?.join(" ") || ""
-          );
-          if (profileDirMatch && profileDirMatch[0]) {
-            const profileDir = path.join(process.cwd(), profileDirMatch[0]);
-            if (fs.existsSync(profileDir)) {
-              fs.rmSync(profileDir, { recursive: true, force: true });
-            }
-          }
-        } catch (err: any) {
-          console.warn(`Could not remove profile directory: ${err.message}`);
-        }
-      } catch (err: any) {
-        console.warn(`Error during browser cleanup: ${err.message}`);
-      }
-    }
-  }
-
   private async checkKeywordRank(
     keyword: string,
     domain: string,
-    proxy: {
-      id: string;
-      host: string;
-      port: number;
-      username?: string;
-      password?: string;
-    },
     location: string,
     language: string = "en",
-    deviceType: "desktop" | "mobile" = "desktop"
+    deviceType: "desktop" | "mobile" = "desktop",
+    proxyConfig: any = null
   ): Promise<{
     result: RankResult;
-    captchaStats: { solved: number; errors: number };
+    captchaStats: CaptchaStats;
   }> {
-    const searchUrl = this.buildGoogleSearchUrl(keyword, location, language);
-    let browser: Browser | null = null;
-    let page: Page | null = null;
+    const searchUrl = buildGoogleSearchUrl(keyword, location, language);
+    let driver: Page | null = null;
     let captchaSolved = 0;
     let captchaErrors = 0;
 
-    try {
-      browser = await this.createBrowser(proxy);
-      if (!browser) {
-        throw new Error("Failed to create browser");
-      }
-      page = await browser.newPage();
-      // const viewportWidth =
-      //   CONFIG.VIEWPORT_WIDTHS[
-      //     Math.floor(Math.random() * CONFIG.VIEWPORT_WIDTHS.length)
-      //   ] || 1920;
-      // const viewportHeight =
-      //   CONFIG.VIEWPORT_HEIGHTS[
-      //     Math.floor(Math.random() * CONFIG.VIEWPORT_HEIGHTS.length)
-      //   ] || 1080;
-      // await page.setViewport({ width: viewportWidth, height: viewportHeight });
-      // page.setUserAgent(
-      //   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-      // );
-      await page.authenticate({
-        username: proxy.username!,
-        password: proxy.password!,
-      });
-      await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(navigator, "webdriver", { get: () => false });
-        Object.defineProperty(navigator, "languages", {
-          get: () => ["en-US", "en"],
-        });
-        Object.defineProperty(navigator, "platform", { get: () => "Win32" });
-        Object.defineProperty(navigator, "vendor", {
-          get: () => "Google Inc.",
-        });
-      });
-      await this.randomDelay();
-      console.log("URL:", searchUrl);
-      // @ts-ignore
-      await page.navigate(searchUrl);
+    console.log(`[DEBUG] Starting checkKeywordRank for "${keyword}"`);
+    console.log(`[DEBUG] Search URL: ${searchUrl}`);
 
-      const { solved, errors, shouldRetryWithNewProxy } =
-        await this.detectAndHandleCaptcha(page);
+    // Validate URL before proceeding
+    try {
+      new URL(searchUrl);
+      console.log(`[DEBUG] URL validation passed`);
+    } catch (urlError) {
+      console.error(`[ERROR] Invalid URL: ${searchUrl}`);
+      throw new Error(`Invalid search URL: ${searchUrl}`);
+    }
+
+    try {
+      console.log(
+        `[DEBUG] Getting page with proxy: ${proxyConfig?.id || "none"}`
+      );
+
+      // Get page with timeout
+      const pagePromise = this.driverManager.getPage(proxyConfig);
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("Page creation timeout")), 60000);
+      });
+
+      driver = (await Promise.race([pagePromise, timeoutPromise])) as Page;
+
+      if (!driver) {
+        throw new Error("Failed to create driver - driver is null");
+      }
+
+      console.log(`[DEBUG] Page created successfully`);
+      console.log(`[DEBUG] Current URL before navigation: ${driver.url()}`);
+
+      // Add random delay before navigation
+      const delay = Math.random() * 3000 + 2000; // 2-5 seconds
+      console.log(
+        `[DEBUG] Waiting ${Math.round(delay)}ms before navigation...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+
+      console.log(`[DEBUG] Starting navigation to: ${searchUrl}`);
+
+      // Navigation with multiple retry attempts
+      let navigationSuccess = false;
+      let lastError: Error | null = null;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          console.log(`[DEBUG] Navigation attempt ${attempt}/3`);
+
+          const response = await driver.goto(searchUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: 90000, // 90 seconds timeout
+          });
+
+          console.log(`[DEBUG] Navigation response received`);
+          console.log(`[DEBUG] Response status: ${response?.status()}`);
+          console.log(`[DEBUG] Final URL: ${driver.url()}`);
+
+          if (!response) {
+            throw new Error("Navigation returned null response");
+          }
+
+          const status = response.status();
+          if (status >= 400) {
+            throw new Error(`Navigation failed with HTTP status: ${status}`);
+          }
+
+          // Check if we actually navigated to the right place
+          const finalUrl = driver.url();
+          if (finalUrl === "about:blank" || finalUrl === "") {
+            throw new Error("Navigation resulted in blank page");
+          }
+
+          navigationSuccess = true;
+          console.log(`[DEBUG] Navigation successful on attempt ${attempt}`);
+          break;
+        } catch (navError: any) {
+          console.error(
+            `[ERROR] Navigation attempt ${attempt} failed: ${navError.message}`
+          );
+          lastError = navError;
+
+          if (attempt < 3) {
+            console.log(`[DEBUG] Waiting before retry...`);
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+
+            // Try to refresh the page context
+            try {
+              await driver.reload({ timeout: 30000 });
+              console.log(`[DEBUG] Page reloaded for retry`);
+            } catch (reloadError) {
+              console.warn(`[WARNING] Page reload failed: ${reloadError}`);
+            }
+          }
+        }
+      }
+
+      if (!navigationSuccess) {
+        throw new Error(
+          `Navigation failed after 3 attempts. Last error: ${lastError?.message}`
+        );
+      }
+
+      console.log(`[DEBUG] Waiting for page to be ready...`);
+
+      // Wait for page to be ready with multiple selectors
+      const selectors = ["body", "html", "#main"];
+      let selectorFound = false;
+
+      for (const selector of selectors) {
+        try {
+          await driver.waitForSelector(selector, {
+            timeout: 30000,
+            state: "attached",
+          });
+          console.log(`[DEBUG] Found selector: ${selector}`);
+          selectorFound = true;
+          break;
+        } catch (selectorError) {
+          console.warn(
+            `[WARNING] Selector '${selector}' not found: ${selectorError}`
+          );
+        }
+      }
+
+      if (!selectorFound) {
+        console.warn(
+          `[WARNING] No selectors found, trying to get page content...`
+        );
+        try {
+          const content = await driver.content();
+          console.log(`[DEBUG] Page content length: ${content.length}`);
+          if (content.length < 100) {
+            console.log(`[DEBUG] Page content: ${content}`);
+            throw new Error("Page appears to be empty or not loaded properly");
+          }
+        } catch (contentError) {
+          console.error(`[ERROR] Cannot get page content: ${contentError}`);
+          throw new Error("Page is not accessible");
+        }
+      }
+
+      // Additional wait to ensure page is fully loaded
+      console.log(`[DEBUG] Waiting additional 3 seconds for page stability...`);
+      await driver.waitForTimeout(3000);
+
+      console.log(`[DEBUG] Checking for CAPTCHA...`);
+
+      const { solved, errors, shouldRetry } =
+        await this.captchaHandler.detectAndHandleCaptcha(driver);
       captchaSolved = solved;
       captchaErrors = errors;
-      if (shouldRetryWithNewProxy) {
-        throw new Error(
-          `CAPTCHA detected and couldn't be solved. Try with new proxy.`
-        );
-        // @ts-ignore
-        return null;
+
+      if (shouldRetry) {
+        throw new Error(`CAPTCHA detected and couldn't be solved. Retrying.`);
       }
 
-      const results = await this.extractSearchResults(page);
+      console.log(`[DEBUG] Extracting search results...`);
+
+      const results = await this.searchResultsParser.extractSearchResults(
+        driver
+      );
+
+      console.log(`[DEBUG] Found ${results.length} search results`);
+
       let rank = 0;
       let rankUrl = "null";
 
@@ -401,6 +349,9 @@ export class RankTrackerWorker {
         if (url && url.includes(domain)) {
           rank = i + 1;
           rankUrl = url;
+          console.log(
+            `[DEBUG] Found domain "${domain}" at rank ${rank}: ${url}`
+          );
           break;
         }
       }
@@ -413,7 +364,6 @@ export class RankTrackerWorker {
           `[INFO] Found ${results.length} results but none matched domain "${domain}"`
         );
 
-        // Log the first few results to help with debugging
         if (results.length > 0) {
           console.log(`[DEBUG] First ${Math.min(5, results.length)} results:`);
           results.slice(0, 5).forEach((result, idx) => {
@@ -421,6 +371,17 @@ export class RankTrackerWorker {
           });
         } else {
           console.log(`[WARNING] No search results found at all!`);
+          // Take a screenshot for debugging
+          try {
+            await driver.screenshot({
+              path: `debug-no-results-${Date.now()}.png`,
+            });
+            console.log(`[DEBUG] Debug screenshot saved`);
+          } catch (screenshotError) {
+            console.warn(
+              `[WARNING] Could not take debug screenshot: ${screenshotError}`
+            );
+          }
         }
 
         rank = 101;
@@ -445,213 +406,43 @@ export class RankTrackerWorker {
         },
       };
     } catch (error: any) {
+      console.error(
+        `[ERROR] checkKeywordRank failed for "${keyword}":`,
+        error.message
+      );
+      console.error(`[ERROR] Stack trace:`, error.stack);
+
+      // Try to get debug info if driver exists
+      if (driver) {
+        try {
+          const currentUrl = driver.url();
+          const title = await driver.title();
+          console.log(
+            `[DEBUG] Error state - URL: ${currentUrl}, Title: ${title}`
+          );
+
+          // Take error screenshot
+          await driver.screenshot({ path: `error-${Date.now()}.png` });
+          console.log(`[DEBUG] Error screenshot saved`);
+        } catch (debugError) {
+          console.warn(`[WARNING] Could not get debug info: ${debugError}`);
+        }
+      }
+
       throw new Error(`Failed to check rank: ${error.message}`);
     } finally {
-      if (page) {
+      if (driver) {
         try {
-          await page
-            .close()
-            .catch((err) => console.warn(`Error closing page: ${err.message}`));
-        } catch (err) {
-          console.warn(`Error closing page: ${err}`);
+          console.log(`[DEBUG] Cleaning up browser...`);
+          const browserKey = proxyConfig
+            ? `proxy_${proxyConfig.id}`
+            : "default";
+          await this.driverManager.closeBrowser(browserKey);
+          console.log(`[DEBUG] Browser cleanup completed`);
+        } catch (cleanupError) {
+          console.error(`[ERROR] Browser cleanup failed: ${cleanupError}`);
         }
       }
-    }
-  }
-  private async randomDelay(): Promise<void> {
-    const mean = CONFIG.BASE_DELAY_MS;
-    const stdDev = CONFIG.BASE_DELAY_MS * 0.3;
-    const u1 = Math.random();
-    const u2 = Math.random();
-    const z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-    const delay = Math.max(200, mean + z0 * stdDev);
-    await this.delay(delay);
-  }
-
-  private async delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  private buildGoogleSearchUrl(
-    keyword: string,
-    location: string,
-    language: string
-  ): string {
-    // TODO: Implement location and language
-    const encodedKeyword = encodeURIComponent(keyword);
-    let url = `https://www.google.com/search?q=${encodedKeyword}&hl=ar&num=${CONFIG.RESULTS_PER_PAGE}`;
-    if (location) {
-      url += `&gl=sa`;
-    }
-    return url;
-  }
-
-  private async extractSearchResults(
-    page: any
-  ): Promise<Array<{ title: string; url: string }>> {
-    return page.evaluate((() => {
-      const results: Array<{ title: string; url: string }> = [];
-
-      const searchResultSelectors = [
-        "div.g",
-        "div.srKDX",
-        "div[data-sokoban-feature]",
-        "div.MjjYud div.A6K0A div.wHYlTd",
-        "div.yuRUbf",
-        "div.tF2Cxc",
-      ];
-
-      const combinedSelector = searchResultSelectors.join(", ");
-      const searchResultElements = Array.from(
-        document.querySelectorAll(combinedSelector)
-      );
-
-      for (const resultElement of searchResultElements) {
-        const linkElement =
-          resultElement.querySelector("a[jsname='UWckNb']") ||
-          resultElement.querySelector("a[data-ved]") ||
-          resultElement.querySelector("a");
-
-        const titleElement =
-          resultElement.querySelector("h3.LC20lb") ||
-          resultElement.querySelector("h3") ||
-          resultElement.querySelector(".DKV0Md");
-
-        if (linkElement && titleElement) {
-          const url = (linkElement as HTMLAnchorElement).href;
-          const title = titleElement.textContent?.trim() || "";
-
-          if (
-            url &&
-            !url.startsWith("https://webcache.googleusercontent.com") &&
-            !url.startsWith("https://translate.google.com") &&
-            !results.some((r) => r.url === url)
-          ) {
-            results.push({ title, url });
-          }
-        }
-      }
-
-      return results.filter(
-        (result, index, self) =>
-          index === self.findIndex((r) => r.url === result.url)
-      );
-    }) as any);
-  }
-  private async detectAndHandleCaptcha(page: Page): Promise<{
-    solved: number;
-    errors: number;
-    shouldRetryWithNewProxy: boolean;
-  }> {
-    let solved = 0;
-    let errors = 0;
-    let shouldRetryWithNewProxy = false;
-
-    try {
-      const captchaSelectors = [
-        // reCAPTCHA selectors
-        "#recaptcha",
-        // Image CAPTCHA selectors
-        "form#captcha-form",
-      ];
-
-      // Check if CAPTCHA is present
-      const captchaType = await page.evaluate((selectors: any) => {
-        for (const selector of selectors) {
-          if (selector.includes(":contains(")) {
-            const [tagName, textContent] = selector.split(":contains(");
-            const text = textContent.replace(/["')]/g, "");
-            const elements = Array.from(document.querySelectorAll(tagName));
-            for (const el of elements) {
-              if (el.textContent && el.textContent.includes(text)) {
-                return "text";
-              }
-            }
-          } else {
-            const element = document.querySelector(selector);
-            if (element) {
-              if (selector.includes("recaptcha")) return "recaptcha";
-              if (
-                selector.includes("captcha-form") ||
-                (selector.includes("img") && selector.includes("captcha"))
-              )
-                return "image";
-              return "recaptcha";
-            }
-          }
-        }
-        return null;
-      }, captchaSelectors);
-
-      if (!captchaType) {
-        return { solved, errors, shouldRetryWithNewProxy: false };
-      }
-
-      console.log(
-        `CAPTCHA detected (Type: ${captchaType})! Attempting to solve once...`
-      );
-
-      try {
-        switch (captchaType) {
-          case "recaptcha":
-            // @ts-ignore
-            await page.solveRecaptchas();
-            solved++;
-            break;
-
-          case "image":
-            errors++;
-            break;
-
-          default:
-            console.log(`Unknown CAPTCHA type: ${captchaType}`);
-            errors++;
-            break;
-        }
-
-        // Try to find and click submit button
-        const submitButton = await page.$(
-          'button[type="submit"], input[type="submit"]'
-        );
-        if (submitButton) {
-          await submitButton.click();
-        }
-
-        await page.waitForNavigation({
-          timeout: CONFIG.BROWSER_TIMEOUT_MS,
-          waitUntil: ["networkidle0", "domcontentloaded"],
-        });
-
-        await this.randomDelay();
-
-        // Check if CAPTCHA is still present after our attempt
-        const stillHasCaptcha = await page.evaluate((selectors) => {
-          return selectors.some((selector) =>
-            selector.includes(":contains(")
-              ? document.body.textContent?.includes(
-                  selector?.split(":contains(")[1]!.replace(/["')]/g, "")
-                )
-              : !!document.querySelector(selector)
-          );
-        }, captchaSelectors);
-
-        if (stillHasCaptcha) {
-          console.log(
-            "CAPTCHA still present after solving attempt. Will retry with new proxy."
-          );
-          shouldRetryWithNewProxy = true;
-        }
-      } catch (error: any) {
-        console.error(`Error solving ${captchaType} CAPTCHA:`, error);
-        errors++;
-        shouldRetryWithNewProxy = true;
-      }
-
-      return { solved, errors, shouldRetryWithNewProxy };
-    } catch (error: any) {
-      console.error(`Error handling CAPTCHA: ${error.message}`);
-      errors++;
-      return { solved, errors, shouldRetryWithNewProxy: true };
     }
   }
 }

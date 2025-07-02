@@ -5,20 +5,94 @@ import * as fs from "fs";
 import * as path from "path";
 import { randomBytes } from "crypto";
 import { CONFIG } from "./config";
+import type { Proxy } from "../proxyManager";
 require("chromedriver-undetected");
 
-export class DriverManager {
-  private driverPool: Map<string, WebDriver> = new Map();
-  private maxDriverAge: number = 300000;
-  private driverCreationTimes: Map<string, number> = new Map();
-  private driverProfileDirs: Map<string, string> = new Map();
-  private readonly profileBaseDir = path.join(process.cwd(), 'selenium_profiles');
+interface TabInfo {
+  handle: string;
+  proxyId: string;
+  isActive: boolean;
+  lastUsed: number;
+  createdAt: number;
+}
 
-  constructor() {
+export class DriverManager {
+  private driver: WebDriver | null = null;
+  private tabs: Map<string, TabInfo> = new Map();
+  private maxTabs: number = 10;
+  private readonly tabTTL: number = 2 * 60 * 1000; // 2 min
+  private tabCleanupInterval: number = 300000;
+  private readonly profileBaseDir = path.join(
+    process.cwd(),
+    "selenium_profiles"
+  );
+  private cleanupTimer: NodeJS.Timeout | null = null;
+
+  constructor(maxTabs: number = 10) {
+    this.maxTabs = maxTabs;
     this.cleanupOldProfiles();
+    this.startTabCleanup();
   }
 
-  private cleanupOldProfiles(maxAge: number =this.maxDriverAge * 2): void {
+  private startTabCleanup(): void {
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupInactiveTabs();
+    }, this.tabCleanupInterval);
+  }
+  private async cleanupInactiveTabs(): Promise<void> {
+    if (!this.driver) return;
+
+    const now = Date.now();
+    const handles = await this.driver.getAllWindowHandles();
+    const tabsToClose: string[] = [];
+
+    for (const [tabId, tabInfo] of this.tabs.entries()) {
+      const isTabClosed = !handles.includes(tabInfo.handle);
+      if (isTabClosed) {
+        this.tabs.delete(tabId);
+        continue;
+      }
+
+      try {
+        await this.driver.switchTo().window(tabInfo.handle);
+        const currentUrl = await this.driver.getCurrentUrl();
+        const isAboutBlank = currentUrl === "about:blank";
+
+        const shouldClose =
+          !tabInfo.isActive &&
+          (now - tabInfo.lastUsed > this.tabCleanupInterval ||
+            now - tabInfo.createdAt > this.tabTTL ||
+            isAboutBlank);
+
+        if (shouldClose) {
+          tabsToClose.push(tabId);
+        }
+      } catch (err: any) {
+        console.warn(`Skipping invalid tab ${tabId}: ${err.message}`);
+        this.tabs.delete(tabId);
+      }
+    }
+
+    for (const tabId of tabsToClose) {
+      await this.closeTab(tabId);
+    }
+
+    const inactiveTabs = Array.from(this.tabs.entries())
+      .filter(([_, info]) => !info.isActive)
+      .sort(([_, a], [__, b]) => a.lastUsed - b.lastUsed);
+
+    if (inactiveTabs.length > this.maxTabs) {
+      const excessTabs = inactiveTabs.slice(
+        0,
+        inactiveTabs.length - this.maxTabs
+      );
+      for (const [tabId] of excessTabs) {
+        await this.closeTab(tabId);
+      }
+    }
+  }
+
+  private cleanupOldProfiles(maxAge: number = 600000): void {
     try {
       if (!fs.existsSync(this.profileBaseDir)) {
         return;
@@ -36,7 +110,9 @@ export class DriverManager {
             fs.rmSync(profilePath, { recursive: true, force: true });
             console.log(`Removed old profile directory: ${profilePath}`);
           } catch (err: any) {
-            console.warn(`Failed to remove old profile: ${profilePath}, Error: ${err.message}`);
+            console.warn(
+              `Failed to remove old profile: ${profilePath}, Error: ${err.message}`
+            );
           }
         }
       }
@@ -45,80 +121,20 @@ export class DriverManager {
     }
   }
 
-  public async getDriver(proxyConfig: any = null): Promise<WebDriver> {
-    this.cleanupOldProfiles();
+  public async initializeBrowser(
+    proxyConfig: Proxy | null = null
+  ): Promise<void> {
+    if (this.driver) {
+      return;
+    }
     try {
-      return await this.createDriver(proxyConfig);
-    } catch (error: any) {
-      console.error(`Error getting driver: ${error.message}`);
-      throw new Error(`Failed to get driver: ${error.message}`);
-    }
-  }
+      // const uniqueId = randomBytes(8).toString("hex");
+      // const userDataDir = path.join(this.profileBaseDir, `profile_${uniqueId}`);
 
-  public async closeDriver(driverKey: string): Promise<void> {
-    const driver = this.driverPool.get(driverKey);
-    if (driver) {
-      try {
-        await driver.quit();
-        this.driverPool.delete(driverKey);
-        this.driverCreationTimes.delete(driverKey);
+      // if (!fs.existsSync(path.dirname(userDataDir))) {
+      //   fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
+      // }
 
-        const profileDir = this.driverProfileDirs.get(driverKey);
-        if (profileDir) {
-          try {
-            console.log(`Removing profile directory: ${profileDir}`);
-            if (fs.existsSync(profileDir)) {
-              fs.rmSync(profileDir, { recursive: true, force: true });
-              console.log(
-                `Successfully removed profile directory: ${profileDir}`
-              );
-            } else {
-              console.log(`Profile directory does not exist: ${profileDir}`);
-            }
-            this.driverProfileDirs.delete(driverKey);
-          } catch (err: any) {
-            console.warn(
-              `Could not remove profile directory ${profileDir}: ${err.message}`
-            );
-          }
-        } else {
-          console.log(
-            `No profile directory found for driver key: ${driverKey}`
-          );
-        }
-      } catch (err: any) {
-        console.warn(`Error during driver cleanup: ${err.message}`);
-      }
-    }
-  }
-
-  private getRandomUserAgent(): string {
-    const index = Math.floor(Math.random() * CONFIG.USER_AGENTS.length);
-    return CONFIG.USER_AGENTS[index] || "";
-  }
-
-  private async createDriver(proxyConfig: any = null): Promise<WebDriver> {
-    const driverKey = proxyConfig
-      ? `proxy_${proxyConfig.id}`
-      : `default_driver`;
-    
-    // Force close any existing driver before creating a new one
-    if (this.driverPool.has(driverKey)) {
-      await this.closeDriver(driverKey);
-    }
-
-    try {
-      const uniqueId = randomBytes(8).toString('hex');
-      const userDataDir = path.join(
-        process.cwd(),
-        `selenium_profiles/profile_${uniqueId}`
-      );
-
-      if (!fs.existsSync(path.dirname(userDataDir))) {
-        fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
-      }
-
-      // Chrome options
       const options = new Options();
       options.addArguments(
         "--no-sandbox",
@@ -126,13 +142,22 @@ export class DriverManager {
         "--disable-blink-features=AutomationControlled",
         "--disable-infobars",
         "--start-maximized",
-        "--headless=new",
         "--log-level=3",
         "--silent",
-        "--disable-dev-shm-usage",  
-        "--disable-gpu",            
-        "--window-size=1920,1080"   
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--window-size=1920,1080",
+        "--enable-features=TabDiscarding,AutoDiscardableTabs",
+        "--force-fieldtrials=TabDiscarding/Enabled/"
       );
+
+      if (proxyConfig) {
+        const proxyUrl = `${proxyConfig.host}:${proxyConfig.port}`;
+        // const proxyArg = `--proxy-server=${proxyUrl}`;
+        // options.addArguments(proxyArg);
+        options.addArguments(`--proxy-server=${proxyUrl}`);
+      }
+
       const loggingPrefs = new logging.Preferences();
       loggingPrefs.setLevel(logging.Type.BROWSER, logging.Level.OFF);
       loggingPrefs.setLevel(logging.Type.DRIVER, logging.Level.OFF);
@@ -143,54 +168,146 @@ export class DriverManager {
       capabilities.set("goog:loggingPrefs", loggingPrefs);
 
       options.addArguments(`--user-agent=${this.getRandomUserAgent()}`);
-      options.addArguments(`--user-data-dir=${userDataDir}`);
-
-      if (proxyConfig) {
-        if (
-          proxyConfig.host &&
-          proxyConfig.port &&
-          proxyConfig.username &&
-          proxyConfig.password
-        ) {
-          const proxyUrl = `${proxyConfig.host}:${proxyConfig.port}`;
-          options.addArguments(`--user-data-dir=${userDataDir}`);
-          options.addArguments(`--proxy-server=${proxyUrl}`);
-
-          try {
-          } catch (error: any) {
-            console.error(`Error creating proxy extension: ${error.message}`);
-          }
-        } else {
-          console.warn("Invalid proxy configuration, continuing without proxy");
-        }
-      }
 
       const serviceBuilder = new chrome.ServiceBuilder();
 
-      const driver = await new Builder()
+      this.driver = await new Builder()
         .forBrowser("chrome")
         .setChromeOptions(options)
         .withCapabilities(capabilities)
         .setChromeService(serviceBuilder)
         .build();
 
-      await driver.manage().setTimeouts({
+      await this.driver.manage().setTimeouts({
         script: CONFIG.BROWSER_TIMEOUT_MS,
         pageLoad: CONFIG.BROWSER_TIMEOUT_MS,
         implicit: 10000,
       });
 
-      this.driverPool.set(driverKey, driver);
-      this.driverCreationTimes.set(driverKey, Date.now());
-      this.driverProfileDirs.set(driverKey, userDataDir);
-
-      await this.addAntiDetectionMeasures(driver);
-
-      return driver;
+      await this.addAntiDetectionMeasures(this.driver);
+      console.log("Browser initialized successfully");
     } catch (error: any) {
-      console.error(`Error creating driver: ${error.message}`);
-      throw new Error(`Failed to create driver: ${error.message}`);
+      console.error(`Error initializing browser: ${error.message}`);
+      throw new Error(`Failed to initialize browser: ${error.message}`);
     }
+  }
+
+  public async getTab(
+    proxyConfig: Proxy | null = null
+  ): Promise<{ driver: WebDriver; tabId: string }> {
+    if (!this.driver) {
+      await this.initializeBrowser(proxyConfig);
+    }
+
+    let existingTabId: string | null = null;
+    for (const [tabId, tabInfo] of this.tabs.entries()) {
+      if (tabInfo.proxyId === proxyConfig?.id && !tabInfo.isActive) {
+        existingTabId = tabId;
+        break;
+      }
+    }
+
+    if (existingTabId) {
+      const tabInfo = this.tabs.get(existingTabId)!;
+      tabInfo.isActive = true;
+      tabInfo.lastUsed = Date.now();
+
+      await this.driver!.switchTo().window(tabInfo.handle);
+      try {
+        await (this.driver as any).sendDevToolsCommand("Page.enable");
+        await (this.driver as any).sendDevToolsCommand(
+          "Page.setAutoDiscardable",
+          {
+            discardable: true,
+          }
+        );
+        console.log(`Marked tab ${existingTabId} as auto-discardable`);
+      } catch (err: any) {
+        console.warn(
+          `Failed to set tab ${existingTabId} as discardable: ${err.message}`
+        );
+      }
+      console.log(
+        `Reusing existing tab ${existingTabId} for proxy ${proxyConfig?.id}`
+      );
+      return { driver: this.driver!, tabId: existingTabId };
+    }
+
+    const tabId = `tab_${randomBytes(4).toString("hex")}`;
+
+    await this.driver!.executeScript("window.open('about:blank', '_blank');");
+    const handles = await this.driver!.getAllWindowHandles();
+    const newHandle = handles[handles.length - 1]!;
+
+    await this.driver!.switchTo().window(newHandle);
+
+    if (proxyConfig?.id !== "default") {
+      await this.setProxy(proxyConfig);
+    }
+
+    this.tabs.set(tabId, {
+      handle: newHandle,
+      proxyId: proxyConfig?.id || "default",
+      isActive: true,
+      lastUsed: Date.now(),
+      createdAt: Date.now(),
+    });
+
+    console.log(`Created new tab ${tabId} for proxy ${proxyConfig?.id}`);
+    return { driver: this.driver!, tabId };
+  }
+
+  public async releaseTab(tabId: string): Promise<void> {
+    console.log(`release tab ${tabId}`);
+    const tabInfo = this.tabs.get(tabId);
+    if (tabInfo) {
+      tabInfo.isActive = false;
+      tabInfo.lastUsed = Date.now();
+      if (this.tabs.size > 1) {
+        this.closeTab(tabId);
+        console.log(`closing tab ${tabId}`);
+      }
+    }
+  }
+
+  private async closeTab(tabId: string): Promise<void> {
+    const tabInfo = this.tabs.get(tabId);
+    if (!tabInfo || !this.driver) return;
+
+    try {
+      const currentHandles = await this.driver.getAllWindowHandles();
+      if (currentHandles.includes(tabInfo.handle)) {
+        await this.driver.switchTo().window(tabInfo.handle);
+        await this.driver.close();
+
+        const remainingHandles = await this.driver.getAllWindowHandles();
+        if (remainingHandles.length > 0) {
+          await this.driver.switchTo().window(remainingHandles[0]!);
+        }
+      }
+
+      this.tabs.delete(tabId);
+      console.log(`Closed tab ${tabId}`);
+    } catch (error: any) {
+      console.warn(`Error closing tab ${tabId}: ${error.message}`);
+      this.tabs.delete(tabId);
+    }
+  }
+
+  private async setProxy(proxyConfig: Proxy | null): Promise<void> {
+    await this.closeBrowser();
+    this.tabs.clear();
+    await this.initializeBrowser(proxyConfig);
+    console.log(
+      `Browser restarted with new proxy: ${
+        proxyConfig ? proxyConfig.host + ":" + proxyConfig.port : "none"
+      }`
+    );
+  }
+
+  private getRandomUserAgent(): string {
+    const index = Math.floor(Math.random() * CONFIG.USER_AGENTS.length);
+    return CONFIG.USER_AGENTS[index] || "";
   }
 
   private async addAntiDetectionMeasures(driver: WebDriver): Promise<void> {
@@ -234,10 +351,36 @@ export class DriverManager {
     }
   }
 
-  public async closeAllDrivers(): Promise<void> {
-    const driverKeys = Array.from(this.driverPool.keys());
-    for (const key of driverKeys) {
-      await this.closeDriver(key);
+  public async closeAllTabs(): Promise<void> {
+    const tabIds = Array.from(this.tabs.keys());
+    for (const tabId of tabIds) {
+      await this.closeTab(tabId);
     }
+  }
+
+  public async closeBrowser(): Promise<void> {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+
+    if (this.driver) {
+      try {
+        await this.driver.quit();
+        this.driver = null;
+        this.tabs.clear();
+        console.log("Browser closed successfully");
+      } catch (error: any) {
+        console.warn(`Error closing browser: ${error.message}`);
+      }
+    }
+  }
+
+  public getActiveTabsCount(): number {
+    return Array.from(this.tabs.values()).filter((tab) => tab.isActive).length;
+  }
+
+  public getTotalTabsCount(): number {
+    return this.tabs.size;
   }
 }
