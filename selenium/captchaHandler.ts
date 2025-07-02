@@ -36,6 +36,12 @@ export class CaptchaHandler {
 
       if (!captchaPresent) {
         return { solved, errors, shouldRetry: false };
+      } else {
+        return {
+          solved: 0,
+          errors: 1,
+          shouldRetry: true,
+        };
       }
 
       console.log(
