@@ -106,16 +106,16 @@ export class DriverManager {
         const profilePath = path.join(this.profileBaseDir, file);
         const stats = fs.statSync(profilePath);
 
-        if (now - stats.mtimeMs > maxAge) {
-          try {
-            fs.rmSync(profilePath, { recursive: true, force: true });
-            console.log(`Removed old profile directory: ${profilePath}`);
-          } catch (err: any) {
-            console.warn(
-              `Failed to remove old profile: ${profilePath}, Error: ${err.message}`
-            );
-          }
+        // if (now - stats.mtimeMs > maxAge) {
+        try {
+          fs.rmSync(profilePath, { recursive: true, force: true });
+          console.log(`Removed old profile directory: ${profilePath}`);
+        } catch (err: any) {
+          console.warn(
+            `Failed to remove old profile: ${profilePath}, Error: ${err.message}`
+          );
         }
+        // }
       }
     } catch (err: any) {
       console.error(`Error during profile cleanup: ${err.message}`);
@@ -129,12 +129,18 @@ export class DriverManager {
       return;
     }
     try {
-      // const uniqueId = randomBytes(8).toString("hex");
-      // const userDataDir = path.join(this.profileBaseDir, `profile_${uniqueId}`);
+      await this.cleanupOldProfiles();
+      await this.closeAllTabs();
+    } catch (error: any) {
+      console.error(`Error during profile cleanup: ${error.message}`);
+    }
+    try {
+      const uniqueId = randomBytes(8).toString("hex");
+      const userDataDir = path.join(this.profileBaseDir, `profile_${uniqueId}`);
 
-      // if (!fs.existsSync(path.dirname(userDataDir))) {
-      //   fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
-      // }
+      if (!fs.existsSync(path.dirname(userDataDir))) {
+        fs.mkdirSync(path.dirname(userDataDir), { recursive: true });
+      }
 
       const options = new Options();
       options.addArguments(
@@ -150,13 +156,12 @@ export class DriverManager {
         "--window-size=1920,1080",
         "--enable-features=TabDiscarding,AutoDiscardableTabs",
         "--force-fieldtrials=TabDiscarding/Enabled/",
-        "--headless=new"
+        "--headless=new",
+        `--user-data-dir=${userDataDir}`
       );
 
       if (proxyConfig) {
         const proxyUrl = `${proxyConfig.host}:${proxyConfig.port}`;
-        // const proxyArg = `--proxy-server=${proxyUrl}`;
-        // options.addArguments(proxyArg);
         options.addArguments(`--proxy-server=${proxyUrl}`);
       }
 
