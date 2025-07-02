@@ -8,14 +8,16 @@ import type { CaptchaStats, RankJobData, RankResult } from "./types";
 import { CONFIG } from "./selenium/config";
 import { buildGoogleSearchUrl, delay, randomDelay } from "./selenium/helpers";
 import ProxyManager from "./proxyManager";
+import type { Proxy } from "./proxyManager";
 
 export class SeleniumRankTracker {
   private statsFile: string;
   private driverManager: DriverManager;
-  private captchaHandler: CaptchaHandler;
-  private searchResultsParser: SearchResultsParser;
   private proxyManager: ProxyManager | null;
   private maxConcurrentTabs: number;
+
+  private static captchaHandler: CaptchaHandler;
+  private static searchResultsParser: SearchResultsParser;
 
   constructor(proxyManager?: ProxyManager, maxConcurrentTabs: number = 5) {
     this.statsFile = path.join(process.cwd(), "rank_stats.csv");
@@ -29,13 +31,19 @@ export class SeleniumRankTracker {
     this.proxyManager = proxyManager || null;
     this.maxConcurrentTabs = maxConcurrentTabs;
     this.driverManager = new DriverManager(maxConcurrentTabs * 2);
-    this.captchaHandler = new CaptchaHandler(process.env.CAPTCHA_API_KEY!);
-    this.searchResultsParser = new SearchResultsParser();
+    if (!SeleniumRankTracker.captchaHandler) {
+      SeleniumRankTracker.captchaHandler = new CaptchaHandler(
+        process.env.CAPTCHA_API_KEY!
+      );
+    }
+    if (!SeleniumRankTracker.searchResultsParser) {
+      SeleniumRankTracker.searchResultsParser = new SearchResultsParser();
+    }
   }
 
-  public async initialize(): Promise<void> {
-    await this.driverManager.initializeBrowser();
-  }
+  // public async initialize(): Promise<void> {
+  //   await this.driverManager.initializeBrowser();
+  // }
 
   public async processJob(job: { data: RankJobData }): Promise<RankResult> {
     const startTime = Date.now();
@@ -82,7 +90,7 @@ export class SeleniumRankTracker {
             location!,
             language,
             deviceType,
-            usedProxyId
+            proxyConfig
           );
 
         captchaSolved += captchaStats.solved;
@@ -175,7 +183,7 @@ export class SeleniumRankTracker {
     location: string,
     language: string = "en",
     deviceType: "desktop" | "mobile" = "desktop",
-    proxyId: string = "default"
+    proxyConfig: Proxy | null = null
   ): Promise<{
     result: RankResult;
     captchaStats: CaptchaStats;
@@ -187,8 +195,7 @@ export class SeleniumRankTracker {
     let captchaErrors = 0;
 
     try {
-      // Get a tab for this proxy
-      const tabResult = await this.driverManager.getTab(proxyId);
+      const tabResult = await this.driverManager.getTab(proxyConfig);
       driver = tabResult.driver;
       tabId = tabResult.tabId;
 
@@ -203,7 +210,7 @@ export class SeleniumRankTracker {
       await driver.wait(until.elementLocated(By.css("body")), 30000);
 
       const { solved, errors, shouldRetry } =
-        await this.captchaHandler.detectAndHandleCaptcha(driver);
+        await SeleniumRankTracker.captchaHandler.detectAndHandleCaptcha(driver);
       captchaSolved = solved;
       captchaErrors = errors;
 
@@ -211,9 +218,10 @@ export class SeleniumRankTracker {
         throw new Error(`CAPTCHA detected and couldn't be solved. Retrying.`);
       }
 
-      const results = await this.searchResultsParser.extractSearchResults(
-        driver
-      );
+      const results =
+        await SeleniumRankTracker.searchResultsParser.extractSearchResults(
+          driver
+        );
       let rank = 0;
       let rankUrl = "null";
 
@@ -276,7 +284,7 @@ export class SeleniumRankTracker {
   public async processMultipleKeywords(
     keywords: Array<{ keyword: string; domain: string; location: string }>
   ): Promise<RankResult[]> {
-    await this.initialize();
+    // await this.initialize();
 
     const results: RankResult[] = [];
     const activeJobs = new Map<string, Promise<RankResult>>();
@@ -322,22 +330,18 @@ export class SeleniumRankTracker {
 
         activeJobs.set(jobId, jobPromise);
 
-        // Add small delay between starting jobs to avoid overwhelming
         await delay(1000);
       }
     };
 
-    // Process all keywords
     while (keywordIndex < keywords.length || activeJobs.size > 0) {
       await processNextKeyword();
 
       if (activeJobs.size > 0) {
-        // Wait for at least one job to complete
         await Promise.race(activeJobs.values());
       }
     }
 
-    // Wait for all remaining jobs to complete
     if (activeJobs.size > 0) {
       await Promise.all(activeJobs.values());
     }

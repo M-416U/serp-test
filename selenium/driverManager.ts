@@ -27,6 +27,7 @@ export class DriverManager {
     "selenium_profiles"
   );
   private cleanupTimer: NodeJS.Timeout | null = null;
+  private currentProxy: Proxy | null = null;
 
   constructor(maxTabs: number = 10) {
     this.maxTabs = maxTabs;
@@ -186,6 +187,7 @@ export class DriverManager {
       });
 
       await this.addAntiDetectionMeasures(this.driver);
+      this.currentProxy = proxyConfig || null;
       console.log("Browser initialized successfully");
     } catch (error: any) {
       console.error(`Error initializing browser: ${error.message}`);
@@ -200,9 +202,16 @@ export class DriverManager {
       await this.initializeBrowser(proxyConfig);
     }
 
+    // Only change proxy if different from current
+    const requestedProxyId = proxyConfig?.id || "default";
+    const currentProxyId = this.currentProxy?.id || "default";
+    if (requestedProxyId !== currentProxyId) {
+      await this.setProxy(proxyConfig);
+    }
+
     let existingTabId: string | null = null;
     for (const [tabId, tabInfo] of this.tabs.entries()) {
-      if (tabInfo.proxyId === proxyConfig?.id && !tabInfo.isActive) {
+      if (tabInfo.proxyId === requestedProxyId && !tabInfo.isActive) {
         existingTabId = tabId;
         break;
       }
@@ -229,7 +238,7 @@ export class DriverManager {
         );
       }
       console.log(
-        `Reusing existing tab ${existingTabId} for proxy ${proxyConfig?.id}`
+        `Reusing existing tab ${existingTabId} for proxy ${requestedProxyId}`
       );
       return { driver: this.driver!, tabId: existingTabId };
     }
@@ -242,19 +251,15 @@ export class DriverManager {
 
     await this.driver!.switchTo().window(newHandle);
 
-    if (proxyConfig?.id !== "default") {
-      await this.setProxy(proxyConfig);
-    }
-
     this.tabs.set(tabId, {
       handle: newHandle,
-      proxyId: proxyConfig?.id || "default",
+      proxyId: requestedProxyId,
       isActive: true,
       lastUsed: Date.now(),
       createdAt: Date.now(),
     });
 
-    console.log(`Created new tab ${tabId} for proxy ${proxyConfig?.id}`);
+    console.log(`Created new tab ${tabId} for proxy ${requestedProxyId}`);
     return { driver: this.driver!, tabId };
   }
 
@@ -299,11 +304,11 @@ export class DriverManager {
     await this.closeBrowser();
     this.tabs.clear();
     await this.initializeBrowser(proxyConfig);
-    console.log(
-      `Browser restarted with new proxy: ${
-        proxyConfig ? proxyConfig.host + ":" + proxyConfig.port : "none"
-      }`
-    );
+    this.currentProxy = proxyConfig || null;
+    const proxyLabel = proxyConfig
+      ? `${proxyConfig.host}:${proxyConfig.port}`
+      : "none";
+    console.log(`Browser restarted with new proxy: ${proxyLabel}`);
   }
 
   private getRandomUserAgent(): string {
