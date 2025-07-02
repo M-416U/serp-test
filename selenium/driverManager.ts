@@ -148,7 +148,8 @@ export class DriverManager {
         "--disable-gpu",
         "--window-size=1920,1080",
         "--enable-features=TabDiscarding,AutoDiscardableTabs",
-        "--force-fieldtrials=TabDiscarding/Enabled/"
+        "--force-fieldtrials=TabDiscarding/Enabled/",
+        "--headless=new"
       );
 
       if (proxyConfig) {
